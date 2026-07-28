@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-28 16:40 CST
+
+- Enabled independent core CI for OpenAPI validation, Rust quality gates,
+  contracts, supply-chain checks, coverage, cross-platform builds, and fuzz
+  smoke tests.
+
 ## 2026-07-28 15:46 CST
 
 - Materialized `listen-core` as the independent backend and contract authority
