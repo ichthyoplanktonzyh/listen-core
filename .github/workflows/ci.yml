@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate OpenAPI 3.1 document
+        run: >-
+          docker run --rm
+          -v "$PWD:/workspace"
+          openapitools/openapi-generator-cli:v7.24.0
+          validate -i /workspace/contracts/openapi/v1.yaml
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny 0.19.7
+        run: cargo install cargo-deny --version 0.19.7 --locked
+      - run: cargo deny --locked check advisories licenses sources
+
+  rust-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: ./scripts/test.sh --rust --strict
+        shell: bash
+
+  rust-cross-platform:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: ./scripts/test.sh --rust --strict
+        shell: bash
+
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/validate-contracts.sh
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info --fail-under-lines 50
+      - run: cargo bench --workspace --no-run --locked
+      - uses: actions/upload-artifact@v5
+        with:
+          name: coverage
+          path: lcov.info
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run srt_parse -- -max_total_time=10
+        working-directory: crates/subtitle-core
+      - run: cargo fuzz run vtt_parse -- -max_total_time=10
+        working-directory: crates/subtitle-core
+      - run: cargo fuzz run asr_timing -- -max_total_time=10
+        working-directory: crates/speech-analysis
