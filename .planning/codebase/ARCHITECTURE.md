@@ -47,6 +47,15 @@ recovery survive a service restart. Transcription jobs use their own
 domain-specific SQLite compare-and-swap transitions because their import stage
 is an explicit irreversible commit point.
 
+Installable dictionary assets resolve through `learning-resource-runtime`.
+The installer and all dictionary readers share its environment override,
+default directory, opaque filename derivation, and file-replacement signature.
+The legacy CMUdict-only path override remains the highest-priority compatibility
+input for that resource.
+Parsed indexes are replaceable caches: an asset installed, replaced, removed,
+or damaged after process start is reflected by subsequent lookups without a
+restart.
+
 Sound-line jobs probe the media's audio-stream inventory before extracting
 evidence. A sole audio stream resolves deterministically to ffmpeg audio index
 zero; media with multiple streams requires an explicit ffmpeg-relative index.
