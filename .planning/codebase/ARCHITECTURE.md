@@ -47,6 +47,27 @@ recovery survive a service restart. Transcription jobs use their own
 domain-specific SQLite compare-and-swap transitions because their import stage
 is an explicit irreversible commit point.
 
+Installable dictionary assets resolve through `learning-resource-runtime`.
+The installer and all dictionary readers share its environment override,
+default directory, opaque filename derivation, and file-replacement signature.
+The legacy CMUdict-only path override remains the highest-priority compatibility
+input for that resource.
+Parsed indexes are replaceable caches: an asset installed, replaced, removed,
+or damaged after process start is reflected by subsequent lookups without a
+restart.
+
+Sound-line jobs probe the media's audio-stream inventory before extracting
+evidence. A sole audio stream resolves deterministically to ffmpeg audio index
+zero; media with multiple streams requires an explicit ffmpeg-relative index.
+The resolved index remains in the durable job and completion event. A missing
+selection, stale selection, or failed probe produces a stable failure code and
+cannot create ready listening evidence from an arbitrary default stream.
+Every generated sound-line candidate also records that index in its timeline
+metrics, so exported analysis remains self-describing without a job lookup.
+Missing source timings or a failed candidate commit leaves the durable job
+failed and emits no completion event; cancellation remains a distinct durable
+terminal state.
+
 Provider credential creation first persists a reserved cleanup reference,
 writes the OS keychain, then atomically activates the profile reference while
 removing that reservation and enqueuing any stale credential. Reservations
