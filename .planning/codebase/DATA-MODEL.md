@@ -10,6 +10,9 @@ Key invariants:
   resources;
 - source snapshots preserve provenance/history but do not impersonate missing
   requested media/audio;
+- `MediaAvailability::Missing` covers detached LLTimeline media and lost real
+  sources; a synthetic `lltimeline://` identity cannot become available through
+  an availability-only update;
 - evidence, projections, overrides, and provider/model provenance remain
   distinguishable;
 - versioned LLTimeline/resource schemas are compatibility boundaries;
