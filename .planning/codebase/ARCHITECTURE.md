@@ -47,13 +47,29 @@ recovery survive a service restart. Transcription jobs use their own
 domain-specific SQLite compare-and-swap transitions because their import stage
 is an explicit irreversible commit point.
 
+Content preparation is the durable internal parent behind the single
+content-level learner action. It accepts media identity and learning language,
+reuses one unambiguous available Subtitle Text Track or creates a deterministic
+ASR child, freezes the resulting exact text snapshot, and then delegates to
+foundation preparation. The runtime chooses or installs its recommended ASR
+model internally; model identity, individual analysis resources, and timeline
+management are not learner decisions. Ambiguous subtitle or audio sources
+return a typed selection requirement instead of silently choosing a stream.
+The resolved audio index is an internal value object, and the ASR child identity
+is derived from the frozen preparation input so explicit retry restarts the
+same durable child rather than adding another job. SoundLine and the separately
+confirmed Phoneme Analysis are not children of this parent.
+
 Foundation learning preparation is a separate application module rather than a
 new generic background-job kind. Its interface accepts an exact media,
 SubtitleTrack selection plus the recommended-foundation intent. Audio-stream
 selection belongs to upstream ASR or separately confirmed phone analysis, not
-this text-derived plan. A fixed typed plan owns the three required fast slots: WordTimeline,
-ChunkTimeline, and SenseGroup. Dedicated SQLite runs use revision
-compare-and-swap and an active-target partial unique index for durable
+this text-derived plan. The frozen track target retains both the raw imported
+track fingerprint and a canonical language/cue/text/token snapshot fingerprint,
+so language correction or retokenization invalidates stale work even when raw
+source provenance is unchanged. A fixed typed plan owns the three required fast
+slots: WordTimeline, ChunkTimeline, and SenseGroup. Dedicated SQLite runs use
+revision compare-and-swap and an active-target partial unique index for durable
 single-flight; startup recovery, cancellation, retry, plan/input fingerprints,
 and artifact references remain preparation-specific.
 The local-runtime coordinator validates the current media and subtitle

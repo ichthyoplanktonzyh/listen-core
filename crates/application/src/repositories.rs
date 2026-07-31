@@ -1273,6 +1273,18 @@ pub enum TranscriptionJobTransition {
     Rejected(TranscriptionJob),
 }
 
+/// Result of claiming a caller-chosen transcription job identity.
+///
+/// Preparation coordinators use a deterministic job ID as their durable
+/// idempotency claim. The repository is the single-flight authority: exactly
+/// one caller creates the row and every concurrent caller receives that same
+/// durable job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateTranscriptionJob {
+    Created(TranscriptionJob),
+    Existing(TranscriptionJob),
+}
+
 pub trait TranscriptionRepository: Send + Sync {
     fn upsert_model(
         &self,
@@ -1285,6 +1297,10 @@ pub trait TranscriptionRepository: Send + Sync {
     ) -> Result<Option<TranscriptionModelDescriptor>, ApplicationError>;
     fn delete_model(&self, id: &TranscriptionModelId) -> Result<(), ApplicationError>;
     fn create_job(&self, job: &TranscriptionJob) -> Result<TranscriptionJob, ApplicationError>;
+    fn create_job_if_absent(
+        &self,
+        job: &TranscriptionJob,
+    ) -> Result<CreateTranscriptionJob, ApplicationError>;
     /// Atomically replaces a job only while its durable status still equals
     /// `expected_status`. This is the sole update interface for transcription
     /// jobs: a stale worker must never overwrite cancellation or another

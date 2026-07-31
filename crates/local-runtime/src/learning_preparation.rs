@@ -7,7 +7,8 @@ use application::{
     LearningPreparationRun, LearningPreparationRunId, LearningPreparationRunRepository,
     LearningPreparationRunStatus, LearningPreparationRunTransition, LearningPreparationUseCases,
     PreparationStepState, PrepareFoundationResult, ReusableFoundationArtifact,
-    WordTimelinePrecision, foundation_chunk_policy, foundation_rule_sense_group_policy, now_ms,
+    WordTimelinePrecision, foundation_chunk_policy, foundation_rule_sense_group_policy,
+    foundation_text_snapshot_fingerprint, now_ms,
 };
 use domain::{
     ChunkTimelineId, MediaAvailability, SenseGroupAnalysisId, SubtitleTokenKind, SubtitleTrack,
@@ -69,6 +70,7 @@ impl LocalFoundationPreparationExecution {
             .ok_or(ApplicationError::NotFound("subtitle track"))?;
         if track.media_id != target.media_id
             || track.fingerprint != target.subtitle_fingerprint
+            || foundation_text_snapshot_fingerprint(&track)? != target.subtitle_text_fingerprint
             || track.status != SubtitleTrackStatus::Available
         {
             return Err(ApplicationError::Conflict(
@@ -818,6 +820,7 @@ mod tests {
             media_fingerprint: "media-fingerprint".into(),
             subtitle_track_id: SubtitleTrackId::parse("track").unwrap(),
             subtitle_fingerprint: "subtitle-fingerprint".into(),
+            subtitle_text_fingerprint: "subtitle-text-fingerprint".into(),
         }
     }
 
@@ -882,6 +885,68 @@ mod tests {
         assert!(matches!(
             audible_structure_availability(None),
             FoundationDerivedAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn language_correction_invalidates_the_frozen_subtitle_text_snapshot() {
+        use application::{ImportSubtitle, RegisterMedia};
+        use domain::{LanguageCode, MediaKind};
+
+        let repository = Arc::new(SqliteRepository::in_memory().unwrap());
+        let services = AppServices::new(
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository,
+        );
+        let media = services
+            .media_analysis()
+            .register_media(RegisterMedia {
+                path: "/test/media.mkv".into(),
+                fingerprint: "media-fingerprint".into(),
+                title: "Test".into(),
+                kind: MediaKind::Video,
+                duration_ms: Some(1_000),
+            })
+            .unwrap();
+        let track = services
+            .media_analysis()
+            .import_subtitle(ImportSubtitle {
+                media_id: media.id.clone(),
+                source_name: "test.srt".into(),
+                content: b"1\n00:00:00,000 --> 00:00:01,000\nHello world\n".to_vec(),
+                language: Some("en".into()),
+                identity_salt: None,
+            })
+            .unwrap();
+        let frozen = FoundationPreparationTarget {
+            media_id: media.id,
+            media_fingerprint: media.fingerprint,
+            subtitle_track_id: track.id.clone(),
+            subtitle_fingerprint: track.fingerprint.clone(),
+            subtitle_text_fingerprint: foundation_text_snapshot_fingerprint(&track).unwrap(),
+        };
+        let execution = LocalFoundationPreparationExecution {
+            services: services.clone(),
+        };
+        execution.validate_target(&frozen).unwrap();
+
+        let corrected = services
+            .media_analysis()
+            .update_track_language(&track.id, &LanguageCode::parse("zh").unwrap())
+            .unwrap();
+
+        assert_eq!(corrected.fingerprint, frozen.subtitle_fingerprint);
+        assert!(matches!(
+            execution.validate_target(&frozen),
+            Err(ApplicationError::Conflict(
+                "learning preparation subtitle snapshot changed"
+            ))
         ));
     }
 }

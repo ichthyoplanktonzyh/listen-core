@@ -24,8 +24,13 @@ python3 -m unittest scripts/test_release_artifacts.py
   plan, WordTimeline-to-Chunk dependency, independent SenseGroup execution, and
   completion without any SoundLine or phoneme-analysis job;
 - preparation state tests cover cancellation CAS conflicts, input replacement,
+  canonical text-snapshot invalidation after language correction/retokenization,
   restart/retry preservation, derived A/B readiness, invalid-artifact rebuild,
   and stable plan identity after artifacts appear;
+- content-preparation tests cover content-level single-flight, exact existing
+  subtitle reuse, typed subtitle/audio ambiguity, deterministic ASR child
+  recovery, automatic compatible-model selection, retry lineage, cancellation,
+  and handoff to the foundation child without SoundLine or phoneme analysis;
 - timeline persistence tests cover atomic activate-if-absent for WordTimeline,
   ChunkTimeline, and SenseGroup, including preservation of an existing active
   user selection and the WordTimeline legacy-timing invariant;

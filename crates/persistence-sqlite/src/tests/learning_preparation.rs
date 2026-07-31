@@ -131,6 +131,7 @@ fn target(media_fingerprint: &str) -> FoundationPreparationTarget {
         media_fingerprint: media_fingerprint.into(),
         subtitle_track_id: SubtitleTrackId::parse("track").unwrap(),
         subtitle_fingerprint: "subtitle-fp".into(),
+        subtitle_text_fingerprint: "subtitle-text-fp".into(),
     }
 }
 
@@ -253,6 +254,37 @@ fn changed_input_invalidates_active_run_before_creating_replacement() {
     assert_eq!(
         repository.get(&first.id).unwrap().unwrap().error.as_deref(),
         Some("preparation inputs or plan changed")
+    );
+}
+
+#[test]
+fn changed_canonical_text_snapshot_invalidates_active_run_with_same_raw_track() {
+    let repository = Arc::new(SqliteRepository::in_memory().unwrap());
+    let use_cases = LearningPreparationUseCases::new(
+        repository.clone(),
+        Arc::new(ScriptedFoundationAdapter::selected()),
+    );
+    let first = prepared(&use_cases, "media-fp", 100);
+    let mut corrected_target = target("media-fp");
+    corrected_target.subtitle_text_fingerprint = "subtitle-text-fp-after-retokenization".into();
+
+    let second = match use_cases.prepare(corrected_target, request(), 200).unwrap() {
+        PrepareFoundationResult::Replaced { run, .. } => *run,
+        other => panic!("expected replacement run, got {other:?}"),
+    };
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(
+        first.target.subtitle_fingerprint,
+        second.target.subtitle_fingerprint
+    );
+    assert_ne!(
+        first.target.subtitle_text_fingerprint,
+        second.target.subtitle_text_fingerprint
+    );
+    assert_eq!(
+        repository.get(&first.id).unwrap().unwrap().status,
+        LearningPreparationRunStatus::Failed
     );
 }
 

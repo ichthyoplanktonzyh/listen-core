@@ -41,9 +41,16 @@ Key invariants:
 - versioned LLTimeline/resource schemas are compatibility boundaries;
 - `LearningPreparationRun` is an application-owned orchestration record, not a
   Learning Object or generic resource. It stores exact source selection,
-  input/plan fingerprints, revision, retry lineage, and four named foundation
-  step slots. Only queued/running/cancelling runs participate in target-level
-  single-flight;
+  raw and canonical text-snapshot fingerprints, input/plan fingerprints,
+  revision, retry lineage, and named foundation step slots. Only
+  queued/running/cancelling runs participate in target-level single-flight;
+- `MediaLearningPreparation` is the durable Content Preparation parent. It
+  stores media and learning-language intent, the resolved existing/ASR subtitle
+  source, exact frozen Subtitle Text Track snapshot, ASR and foundation child
+  provenance, revision, and retry lineage. Its SQLite partial unique index
+  permits only one active preparation for a Content Document target. A resolved
+  ASR source contains a typed audio-stream index, and retry reuses the child
+  identity derived from the stable preparation input;
 - destructive migration or cascade behavior requires explicit requirement,
   tests, and release/migration notes.
 

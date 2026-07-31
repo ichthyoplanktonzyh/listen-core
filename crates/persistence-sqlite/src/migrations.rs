@@ -18,8 +18,8 @@ use super::PersistenceError;
 // v54 corrects legacy detached LLTimeline media availability without touching
 // subtitle, analysis-resource, or learning-history rows. v55 adds the dedicated
 // typed learning-preparation run store and its active-target single-flight
-// authority.
-pub const MIGRATION_VERSION: u32 = 55;
+// authority. v56 adds the intent-specific media preparation parent.
+pub const MIGRATION_VERSION: u32 = 56;
 
 pub fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -470,6 +470,16 @@ pub fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
             ))?;
         }
         tx.pragma_update(None, "user_version", 55)?;
+        tx.commit()?;
+    }
+    if current < 56 {
+        let tx = connection.unchecked_transaction()?;
+        if !table_exists(&tx, "media_learning_preparations")? {
+            tx.execute_batch(include_str!(
+                "../migrations/0056_media_learning_preparations.sql"
+            ))?;
+        }
+        tx.pragma_update(None, "user_version", 56)?;
         tx.commit()?;
     }
     Ok(())

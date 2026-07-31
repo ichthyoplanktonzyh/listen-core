@@ -11,6 +11,7 @@ mod learning_preparation;
 mod lexical;
 mod llm_provider;
 mod media;
+mod media_learning_preparation;
 mod migrations;
 mod personal_expression;
 mod phonetic_analysis;

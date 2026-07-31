@@ -36,6 +36,80 @@ fn archived_transcription_jobs_are_hidden_from_list_and_reuse() {
 }
 
 #[test]
+fn deterministic_transcription_job_claim_returns_the_existing_job() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    MediaRepository::upsert(&repo, &transcription_media()).unwrap();
+    let job = transcription_job(
+        "deterministic-child",
+        "preparation-input",
+        TranscriptionJobStatus::Queued,
+        10,
+    );
+
+    assert_eq!(
+        repo.create_job_if_absent(&job).unwrap(),
+        CreateTranscriptionJob::Created(job.clone())
+    );
+
+    let mut conflicting_candidate = job.clone();
+    conflicting_candidate.input_fingerprint = "different-input".into();
+    assert_eq!(
+        repo.create_job_if_absent(&conflicting_candidate).unwrap(),
+        CreateTranscriptionJob::Existing(job)
+    );
+}
+
+#[test]
+fn replacing_transcription_provenance_keeps_the_indexed_job_id_in_sync() {
+    let repo = SqliteRepository::in_memory().unwrap();
+    MediaRepository::upsert(&repo, &transcription_media()).unwrap();
+    let track = word_timeline_track();
+    repo.save_track(&track).unwrap();
+    let first = transcription_job(
+        "provenance-job-1",
+        "provenance-input-1",
+        TranscriptionJobStatus::Completed,
+        10,
+    );
+    let second = transcription_job(
+        "provenance-job-2",
+        "provenance-input-2",
+        TranscriptionJobStatus::Completed,
+        20,
+    );
+    repo.create_job(&first).unwrap();
+    repo.create_job(&second).unwrap();
+    let provenance = |job: &TranscriptionJob| SubtitleTrackProvenance {
+        track_id: track.id.clone(),
+        transcription_job_id: job.id.clone(),
+        provider_id: job.provider_id.clone(),
+        runtime_version: job.runtime_version.clone(),
+        model_id: job.model_id.clone(),
+        model_revision: job.model_revision.clone(),
+        model_checksum_sha256: job.model_checksum_sha256.clone(),
+        settings_json: job.settings_json.clone(),
+        created_at_ms: job.updated_at_ms,
+    };
+
+    repo.save_provenance(&provenance(&first)).unwrap();
+    repo.save_provenance(&provenance(&second)).unwrap();
+
+    let (indexed_job_id, provenance_json): (String, String) = repo
+        .connection
+        .lock()
+        .query_row(
+            "SELECT transcription_job_id,provenance_json
+             FROM subtitle_track_provenance WHERE track_id=?1",
+            [track.id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let stored: SubtitleTrackProvenance = serde_json::from_str(&provenance_json).unwrap();
+    assert_eq!(indexed_job_id, second.id.as_str());
+    assert_eq!(stored.transcription_job_id, second.id);
+}
+
+#[test]
 fn cancellation_wins_over_a_stale_worker_phase_transition() {
     let repo = SqliteRepository::in_memory().unwrap();
     MediaRepository::upsert(&repo, &transcription_media()).unwrap();

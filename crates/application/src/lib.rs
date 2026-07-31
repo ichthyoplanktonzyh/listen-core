@@ -69,6 +69,7 @@ mod lexical;
 mod listening;
 mod llm_provider;
 mod media;
+mod media_learning_preparation;
 mod personal_expression;
 mod phones;
 mod phonetic_fixture;
@@ -97,7 +98,7 @@ mod word_timelines;
 pub use background_jobs::{
     BackgroundJobStore, BackgroundJobTransition, InMemoryBackgroundJobStore,
 };
-pub use chunks::foundation_chunk_policy;
+pub use chunks::{foundation_chunk_policy, foundation_text_snapshot_fingerprint};
 pub use coach_dashboard::{
     CoachAssessmentSummary, CoachChannelStatus, CoachChannelSummary, CoachDashboard,
     CoachEvidenceItem, CoachFeatureAvailability, CoachMaterialInsight, CoachMetric,
@@ -112,6 +113,7 @@ pub use learning_preparation::*;
 pub use lexical::LexicalLearningUseCases;
 pub use llm_provider::LlmProviderUseCases;
 pub use media::MediaAnalysisUseCases;
+pub use media_learning_preparation::*;
 pub use personal_expression::PersonalExpressionUseCases;
 pub use practice::PracticeUseCases;
 pub use production_corpus::ProductionCorpusUseCases;
