@@ -1,13 +1,13 @@
 use super::*;
 use application::{
     AppServices, ApplicationError, ChunkTimelineRepository, CoachDashboardRepository,
-    DictionaryProvider, DictionaryProviderError, ImportSubtitle, LLTimelineResourceRepository,
-    LearningEventRepository, LearningObservationRepository, LexicalCapabilityRepository,
-    LexicalEntryRepository, ListeningInboxRepository, MediaRepository, PhoneTimelineRepository,
-    PhoneticAnalysisRepository, PracticeRepository, PronunciationRepository,
-    RecognitionUpgradeRepository, RegisterMedia, ReviewQueueRepository, SenseGroupRepository,
-    SubtitleTrackRepository, TranscriptionJobTransition, TranscriptionRepository,
-    UpsertLexicalEntry, VocabularyAssetRepository, WordTimelineRepository,
+    CreateTranscriptionJob, DictionaryProvider, DictionaryProviderError, ImportSubtitle,
+    LLTimelineResourceRepository, LearningEventRepository, LearningObservationRepository,
+    LexicalCapabilityRepository, LexicalEntryRepository, ListeningInboxRepository, MediaRepository,
+    PhoneTimelineRepository, PhoneticAnalysisRepository, PracticeRepository,
+    PronunciationRepository, RecognitionUpgradeRepository, RegisterMedia, ReviewQueueRepository,
+    SenseGroupRepository, SubtitleTrackRepository, TranscriptionJobTransition,
+    TranscriptionRepository, UpsertLexicalEntry, VocabularyAssetRepository, WordTimelineRepository,
 };
 
 #[test]
@@ -635,6 +635,7 @@ mod learning_loop;
 mod learning_preparation;
 mod lexical;
 mod llm_provider;
+mod media_learning_preparation;
 mod media_library;
 mod migrations;
 mod personal_expression;

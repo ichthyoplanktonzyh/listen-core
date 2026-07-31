@@ -1,4 +1,6 @@
-use application::{ApplicationError, TranscriptionJobTransition, TranscriptionRepository};
+use application::{
+    ApplicationError, CreateTranscriptionJob, TranscriptionJobTransition, TranscriptionRepository,
+};
 use domain::{
     SubtitleTrackProvenance, TranscriptionJob, TranscriptionJobId, TranscriptionJobStatus,
     TranscriptionModelDescriptor, TranscriptionModelId,
@@ -87,6 +89,41 @@ impl TranscriptionRepository for SqliteRepository {
             )
             .map_err(repo)?;
         Ok(job.clone())
+    }
+
+    fn create_job_if_absent(
+        &self,
+        job: &TranscriptionJob,
+    ) -> Result<CreateTranscriptionJob, ApplicationError> {
+        let mut conn = self.connection.lock();
+        let tx = conn.transaction().map_err(repo)?;
+        let existing = tx
+            .query_row(
+                "SELECT job_json FROM transcription_jobs WHERE id=?1",
+                [job.id.as_str()],
+                |row| from_json::<TranscriptionJob>(&row.get::<_, String>(0)?),
+            )
+            .optional()
+            .map_err(repo)?;
+        if let Some(existing) = existing {
+            tx.commit().map_err(repo)?;
+            return Ok(CreateTranscriptionJob::Existing(existing));
+        }
+        tx.execute(
+            "INSERT INTO transcription_jobs(id,media_id,input_fingerprint,status,job_json,updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                job.id.as_str(),
+                job.media_id.as_str(),
+                job.input_fingerprint,
+                json(&job.status)?,
+                json(job)?,
+                job.updated_at_ms
+            ],
+        )
+        .map_err(repo)?;
+        tx.commit().map_err(repo)?;
+        Ok(CreateTranscriptionJob::Created(job.clone()))
     }
 
     fn transition_job(
@@ -220,7 +257,9 @@ impl TranscriptionRepository for SqliteRepository {
             .execute(
                 "INSERT INTO subtitle_track_provenance(track_id,transcription_job_id,provenance_json)
                  VALUES (?1,?2,?3)
-                 ON CONFLICT(track_id) DO UPDATE SET provenance_json=excluded.provenance_json",
+                 ON CONFLICT(track_id) DO UPDATE SET
+                   transcription_job_id=excluded.transcription_job_id,
+                   provenance_json=excluded.provenance_json",
                 params![
                     provenance.track_id.as_str(),
                     provenance.transcription_job_id.as_str(),

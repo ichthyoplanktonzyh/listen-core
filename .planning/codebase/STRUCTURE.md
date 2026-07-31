@@ -32,9 +32,17 @@ Notable runtime seams:
   foundation planner and typed state machine. Its dedicated SQLite repository
   owns revision CAS and target-level single-flight; it does not inherit
   `BackgroundJobStore`.
+- `application::MediaLearningPreparationUseCases` owns the durable content
+  preparation parent, including exact Subtitle Text Track snapshot identity,
+  typed ASR/foundation child slots, retry lineage, and content-level
+  single-flight.
 - `local_runtime::LearningPreparationCoordinator` adapts the fixed foundation
   plan to `AppServices`; it has no HTTP route, SoundLine dependency, or generic
   resource/job abstraction.
+- `local_runtime::MediaLearningPreparationCoordinator` resolves unambiguous
+  subtitle/audio sources, ensures a deterministic ASR child when needed, and
+  hands the frozen text snapshot to foundation preparation without exposing
+  model or timeline controls.
 - `SecretCleanupRepository` and atomic profile-mutation methods own the durable
   provider-credential cleanup outbox.
 - `SemanticLlmRuntimeFactory` and `RealtimeConversationAdapterFactory` keep

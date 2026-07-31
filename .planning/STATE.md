@@ -14,15 +14,15 @@
 
 ## Current Work
 
-The internal recommended-foundation preparation module now owns exact source
-selection, fixed typed preparation slots, durable single-flight, revision CAS,
-cancellation/retry/recovery, and local-runtime execution through the three fast
-required analyses: WordTimeline, ChunkTimeline, and SenseGroup. Citation and
-predicted audible structures (views A/B) are derived from WordTimeline rather
-than persisted as preparation jobs. SoundLine is independent best-effort
-enrichment; observed phone evidence (view C) remains a separately confirmed
-Phoneme Analysis. The module remains internal until the media-level one-click
-journey in issue #103 supplies or creates the exact Subtitle Text Track.
+Issue #103 now has an internal durable Content Preparation parent behind the
+single content-level learner action. It reuses one unambiguous available
+Subtitle Text Track or owns a deterministic ASR child, freezes the exact
+language/text snapshot, and then delegates to recommended Foundation
+Preparation for WordTimeline, ChunkTimeline, SenseGroup, and the derived A/B
+readiness views. Child provenance, single-flight, input replacement,
+cancellation, retry, and restart recovery are durable. Model and timeline
+choices remain internal; SoundLine is independent and observed phone evidence
+(view C) still requires a separate learner decision.
 
 ## Established Boundaries
 
@@ -31,6 +31,9 @@ journey in issue #103 supplies or creates the exact Subtitle Text Track.
 - Cross-repo synchronization uses immutable releases and explicit lock updates.
 - Imported monorepo planning is frozen under `archive/monorepo-baseline/`.
 - Root `CHANGELOG.md` is updated only by a release owner from merged PRs.
+- Manual timeline editing and generic technical-resource destinations are not
+  part of the learner journey. Existing core lifecycle/write contracts remain
+  compatibility surfaces until a separately coordinated breaking migration.
 
 ## Known Operational Constraint
 
@@ -40,14 +43,17 @@ not code evidence.
 
 ## Next
 
-1. Implement issue #103 as the media-level one-click entry: reuse an exact
-   Subtitle Text Track or run ASR, then enter foundation preparation.
-2. Split core issue #80 into a production-model slice followed by an
+1. Complete the app-originated contract/handoff for the content-level prepare
+   action without exposing model, resource, or timeline controls.
+2. Coordinate removal of manual timeline editing from the app; deprecate or
+   remove published core write routes only through an explicit compatibility
+   decision.
+3. Split core issue #80 into a production-model slice followed by an
    app-originated contract slice; do not promote the English-centric spike
    variant enums into the multilingual contract.
-3. Publish immutable `1.1.0` contract/runtime artifacts only after owner
+4. Publish immutable `1.1.0` contract/runtime artifacts only after owner
    approval, then complete the `listen-app` lock and DTO handoff.
-4. Run the Apple Silicon short-audio cascade smoke only with explicit model
+5. Run the Apple Silicon short-audio cascade smoke only with explicit model
    download/live-inference authorization.
-5. Remove the exact `local-runtime` HTTP route debt allowlist one route module
+6. Remove the exact `local-runtime` HTTP route debt allowlist one route module
    at a time.

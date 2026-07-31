@@ -1,24 +1,29 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use api_events::{EventEnvelope, EventName};
 use application::{
-    AppServices, ApplicationError, ImportSubtitle, TranscriptionJobTransition,
-    TranscriptionRepository, now_ms,
+    AppServices, ApplicationError, CreateTranscriptionJob, ImportSubtitle,
+    TranscriptionJobTransition, TranscriptionRepository, now_ms,
 };
 use domain::{
-    MediaId, RecordingTranscriptProvenance, RecordingTranscriptionJob, RecordingTranscriptionJobId,
-    RecordingTranscriptionStatus, SubtitleTrackProvenance, TranscriptionDestination,
-    TranscriptionJob, TranscriptionJobId, TranscriptionJobStatus, TranscriptionModelDescriptor,
-    TranscriptionModelId, TranscriptionModelState, TranscriptionProviderInfo, TranscriptionPurpose,
-    TranscriptionQuality, TranscriptionSegment,
+    MediaAvailability, MediaId, RecordingTranscriptProvenance, RecordingTranscriptionJob,
+    RecordingTranscriptionJobId, RecordingTranscriptionStatus, SubtitleTrackProvenance,
+    SubtitleTrackStatus, TranscriptionDestination, TranscriptionJob, TranscriptionJobId,
+    TranscriptionJobStatus, TranscriptionModelDescriptor, TranscriptionModelId,
+    TranscriptionModelState, TranscriptionProviderInfo, TranscriptionPurpose, TranscriptionQuality,
+    TranscriptionSegment,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, broadcast};
 
 use crate::download::{ArtifactDownloader, DownloadProgress, ReqwestArtifactDownloader};
-use crate::process::{CancellationProbe, ProcessRunner, ProcessSpec, TokioProcessRunner};
+use crate::process::{
+    CancellationProbe, NeverCancelled, ProcessOutputObserver, ProcessRunner, ProcessSpec,
+    TokioProcessRunner,
+};
 use crate::runtime_support::{
     ffmpeg_wav_args, file_id, hash_file, io_error, resolve_tool, support_dir,
 };
@@ -33,6 +38,8 @@ pub struct TranscriptionCoordinator {
     temp_dir: PathBuf,
     process_runner: Arc<dyn ProcessRunner>,
     downloader: Arc<dyn ArtifactDownloader>,
+    ffprobe: Option<PathBuf>,
+    recommended_model_install: Arc<tokio::sync::Mutex<()>>,
     recording_jobs: Arc<Mutex<HashMap<RecordingTranscriptionJobId, RecordingTranscriptionJob>>>,
 }
 
@@ -53,6 +60,84 @@ pub struct CreateRecordingTranscriptionRequest {
     pub recording_id: String,
     pub model_id: String,
     pub language: Option<String>,
+}
+
+/// Exact, provider-neutral input for an ASR child owned by the internal
+/// media-preparation journey. The parent resolves audio ambiguity before
+/// calling this seam; the ASR operation always transcribes the selected source
+/// language and never claims subtitle-selection authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsurePreparationTranscriptionRequest {
+    pub idempotency_key: String,
+    pub child_id: TranscriptionJobId,
+    pub media_id: MediaId,
+    pub language: Option<String>,
+    pub audio_track: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationTranscriptionDisposition {
+    Created,
+    ExistingActive,
+    ReusedCompleted,
+    RestartedInterrupted,
+    RestartedInvalidCompletion,
+    ExistingTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredPreparationTranscription {
+    pub disposition: PreparationTranscriptionDisposition,
+    pub job: TranscriptionJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparationAudioSelection {
+    Selected { audio_track: u32 },
+    SelectionRequired { reason: &'static str },
+    Unavailable { reason: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparationTranscriptionModelSelection {
+    Ready { model_id: TranscriptionModelId },
+    InstallRecommended { model_id: TranscriptionModelId },
+}
+
+pub fn preparation_transcription_child_id(
+    idempotency_key: &str,
+) -> Result<TranscriptionJobId, ApplicationError> {
+    if idempotency_key.trim().is_empty() {
+        return Err(ApplicationError::Validation(
+            "preparation transcription idempotency key",
+        ));
+    }
+    Ok(TranscriptionJobId::from_fingerprint(
+        "preparation-transcription-child",
+        idempotency_key,
+    ))
+}
+
+pub fn resolve_preparation_audio_selection(
+    audio_track_count: usize,
+    requested_audio_track: Option<u32>,
+) -> PreparationAudioSelection {
+    match (audio_track_count, requested_audio_track) {
+        (0, _) => PreparationAudioSelection::Unavailable {
+            reason: "audio_track_not_found",
+        },
+        (1, None) => PreparationAudioSelection::Selected { audio_track: 0 },
+        (count, None) if count > 1 => PreparationAudioSelection::SelectionRequired {
+            reason: "audio_track_required",
+        },
+        (count, Some(audio_track)) if (audio_track as usize) < count => {
+            PreparationAudioSelection::Selected { audio_track }
+        }
+        (_, Some(_)) => PreparationAudioSelection::Unavailable {
+            reason: "audio_track_not_found",
+        },
+        _ => unreachable!("all audio-track selection states are covered"),
+    }
 }
 
 impl TranscriptionCoordinator {
@@ -92,6 +177,24 @@ impl TranscriptionCoordinator {
         process_runner: Arc<dyn ProcessRunner>,
         downloader: Arc<dyn ArtifactDownloader>,
     ) -> Result<Self, ApplicationError> {
+        Self::new_with_adapters_and_ffprobe(
+            services,
+            repository,
+            events,
+            process_runner,
+            downloader,
+            resolve_tool("LLPLAYERNEXT_FFPROBE", "ffprobe"),
+        )
+    }
+
+    fn new_with_adapters_and_ffprobe(
+        services: AppServices,
+        repository: Arc<dyn TranscriptionRepository>,
+        events: broadcast::Sender<EventEnvelope>,
+        process_runner: Arc<dyn ProcessRunner>,
+        downloader: Arc<dyn ArtifactDownloader>,
+        ffprobe: Option<PathBuf>,
+    ) -> Result<Self, ApplicationError> {
         let support = support_dir();
         let value = Self {
             services,
@@ -102,6 +205,8 @@ impl TranscriptionCoordinator {
             temp_dir: std::env::temp_dir().join("LLPlayerNext/transcription"),
             process_runner,
             downloader,
+            ffprobe,
+            recommended_model_install: Arc::new(tokio::sync::Mutex::new(())),
             recording_jobs: Arc::default(),
         };
         value.repository.interrupt_active_jobs(now_ms())?;
@@ -439,6 +544,188 @@ impl TranscriptionCoordinator {
         request: CreateJobRequest,
         retry_of_job_id: Option<TranscriptionJobId>,
     ) -> Result<TranscriptionJob, ApplicationError> {
+        let force = request.force;
+        let job = self.build_job_candidate(request, retry_of_job_id, None)?;
+        if !force && let Some(job) = self.repository.find_completed_job(&job.input_fingerprint)? {
+            return Ok(job);
+        }
+        let job = self.repository.create_job(&job)?;
+        self.emit(EventName::TranscriptionJobChanged, &job);
+        self.clone().start_job(job.id.clone());
+        Ok(job)
+    }
+
+    /// Probe the exact media before ASR so a missing or ambiguous audio stream
+    /// becomes a typed preparation result instead of an ffmpeg default.
+    pub async fn resolve_preparation_audio_track(
+        &self,
+        media_id: &MediaId,
+        requested_audio_track: Option<u32>,
+    ) -> Result<PreparationAudioSelection, ApplicationError> {
+        let media = self
+            .services
+            .media_analysis()
+            .read_media(media_id)?
+            .ok_or(ApplicationError::NotFound("media"))?;
+        if media.availability != MediaAvailability::Available {
+            return Ok(PreparationAudioSelection::Unavailable {
+                reason: "media_unavailable",
+            });
+        }
+        let Some(ffprobe) = self.ffprobe.clone() else {
+            return Ok(PreparationAudioSelection::Unavailable {
+                reason: "audio_track_probe_failed",
+            });
+        };
+        let counter = Arc::new(PreparationAudioTrackCounter::default());
+        if self
+            .process_runner
+            .run_streaming(
+                ProcessSpec::new(
+                    ffprobe,
+                    vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-select_streams".into(),
+                        "a".into(),
+                        "-show_entries".into(),
+                        "stream=index".into(),
+                        "-of".into(),
+                        "csv=p=0".into(),
+                        media.path,
+                    ],
+                ),
+                Arc::new(NeverCancelled),
+                counter.clone(),
+            )
+            .await
+            .is_err()
+        {
+            return Ok(PreparationAudioSelection::Unavailable {
+                reason: "audio_track_probe_failed",
+            });
+        }
+        Ok(resolve_preparation_audio_selection(
+            counter.count(),
+            requested_audio_track,
+        ))
+    }
+
+    /// Create or recover the deterministic ASR child owned by an internal
+    /// media-preparation run. Public transcription endpoints keep their
+    /// existing timestamped create/retry behavior; only this seam reuses a
+    /// caller-chosen child identity and restarts interrupted work in place.
+    pub async fn ensure_preparation_transcription(
+        self: &Arc<Self>,
+        request: EnsurePreparationTranscriptionRequest,
+    ) -> Result<EnsuredPreparationTranscription, ApplicationError> {
+        let expected_id = preparation_transcription_child_id(&request.idempotency_key)?;
+        if request.child_id != expected_id {
+            return Err(ApplicationError::Invalid(
+                "preparation transcription child ID does not match its idempotency key".into(),
+            ));
+        }
+        if let Some(existing) = self.repository.get_job(&request.child_id)? {
+            self.validate_existing_preparation_job(&existing, &request)?;
+            let (ensured, should_start) = self.claim_existing_preparation_job(existing)?;
+            if should_start {
+                self.clone().start_job(ensured.job.id.clone());
+            }
+            return Ok(ensured);
+        }
+        if !self
+            .providers()
+            .into_iter()
+            .any(|provider| provider.available)
+        {
+            return Err(ApplicationError::Validation("transcription runtime"));
+        }
+        let model_id = self
+            .ensure_recommended_preparation_model(request.language.as_deref())
+            .await?;
+        let candidate = self.build_job_candidate(
+            CreateJobRequest {
+                media_id: request.media_id.as_str().to_owned(),
+                model_id: model_id.as_str().to_owned(),
+                destination: TranscriptionDestination::Primary,
+                purpose: TranscriptionPurpose::Transcribe,
+                language: request.language,
+                audio_track: Some(request.audio_track),
+                force: false,
+            },
+            None,
+            Some(request.child_id),
+        )?;
+        let (ensured, should_start) = self.claim_preparation_job(candidate)?;
+        if should_start {
+            self.clone().start_job(ensured.job.id.clone());
+        }
+        Ok(ensured)
+    }
+
+    fn validate_existing_preparation_job(
+        &self,
+        job: &TranscriptionJob,
+        request: &EnsurePreparationTranscriptionRequest,
+    ) -> Result<(), ApplicationError> {
+        let media = self
+            .services
+            .media_analysis()
+            .read_media(&request.media_id)?
+            .ok_or(ApplicationError::NotFound("media"))?;
+        if job.id != request.child_id
+            || job.media_id != request.media_id
+            || job.media_fingerprint != media.fingerprint
+            || job.destination != TranscriptionDestination::Primary
+            || job.purpose != TranscriptionPurpose::Transcribe
+            || job.requested_language != request.language
+            || job.audio_track != Some(request.audio_track)
+            || job.input_fingerprint.trim().is_empty()
+            || job.archived_at_ms.is_some()
+        {
+            return Err(ApplicationError::Conflict(
+                "preparation transcription idempotency key is already bound to different inputs",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn recommended_preparation_model(
+        &self,
+        language: Option<&str>,
+    ) -> Result<PreparationTranscriptionModelSelection, ApplicationError> {
+        select_preparation_model(&self.repository.list_models()?, language)
+    }
+
+    async fn ensure_recommended_preparation_model(
+        self: &Arc<Self>,
+        language: Option<&str>,
+    ) -> Result<TranscriptionModelId, ApplicationError> {
+        let _guard = self.recommended_model_install.lock().await;
+        match self.recommended_preparation_model(language)? {
+            PreparationTranscriptionModelSelection::Ready { model_id } => Ok(model_id),
+            PreparationTranscriptionModelSelection::InstallRecommended { model_id } => {
+                let model = self.clone().install_model(model_id.clone()).await?;
+                if matches!(
+                    model.state,
+                    TranscriptionModelState::Installed | TranscriptionModelState::Custom
+                ) {
+                    Ok(model_id)
+                } else {
+                    Err(ApplicationError::Repository(model.error.unwrap_or_else(
+                        || "recommended ASR model installation failed".into(),
+                    )))
+                }
+            }
+        }
+    }
+
+    fn build_job_candidate(
+        &self,
+        request: CreateJobRequest,
+        retry_of_job_id: Option<TranscriptionJobId>,
+        deterministic_id: Option<TranscriptionJobId>,
+    ) -> Result<TranscriptionJob, ApplicationError> {
         let media_id = MediaId::parse(request.media_id)?;
         let media = self
             .services
@@ -481,17 +768,14 @@ impl TranscriptionCoordinator {
             model.checksum_sha256,
             settings_json
         )));
-        if !request.force
-            && let Some(job) = self.repository.find_completed_job(&input_fingerprint)?
-        {
-            return Ok(job);
-        }
         let created_at_ms = now_ms();
-        let job = TranscriptionJob {
-            id: TranscriptionJobId::from_fingerprint(
-                "transcription-job",
-                &format!("{input_fingerprint}:{created_at_ms}"),
-            ),
+        Ok(TranscriptionJob {
+            id: deterministic_id.unwrap_or_else(|| {
+                TranscriptionJobId::from_fingerprint(
+                    "transcription-job",
+                    &format!("{input_fingerprint}:{created_at_ms}"),
+                )
+            }),
             media_id,
             media_title: media.title,
             media_fingerprint: media.fingerprint,
@@ -520,13 +804,136 @@ impl TranscriptionCoordinator {
             completed_at_ms: None,
             updated_at_ms: created_at_ms,
             archived_at_ms: None,
+        })
+    }
+
+    fn claim_preparation_job(
+        &self,
+        candidate: TranscriptionJob,
+    ) -> Result<(EnsuredPreparationTranscription, bool), ApplicationError> {
+        let job = match self.repository.create_job_if_absent(&candidate)? {
+            CreateTranscriptionJob::Created(job) => {
+                self.emit(EventName::TranscriptionJobChanged, &job);
+                return Ok((
+                    EnsuredPreparationTranscription {
+                        disposition: PreparationTranscriptionDisposition::Created,
+                        job,
+                    },
+                    true,
+                ));
+            }
+            CreateTranscriptionJob::Existing(job) => job,
         };
-        let job = self.repository.create_job(&job)?;
-        self.emit(EventName::TranscriptionJobChanged, &job);
-        let coordinator = self.clone();
-        let id = job.id.clone();
-        tokio::spawn(async move { coordinator.run_job(id).await });
-        Ok(job)
+        if job.id != candidate.id
+            || job.media_id != candidate.media_id
+            || job.media_fingerprint != candidate.media_fingerprint
+            || job.input_fingerprint != candidate.input_fingerprint
+        {
+            return Err(ApplicationError::Conflict(
+                "preparation transcription idempotency key is already bound to different inputs",
+            ));
+        }
+        self.claim_existing_preparation_job(job)
+    }
+
+    fn claim_existing_preparation_job(
+        &self,
+        mut job: TranscriptionJob,
+    ) -> Result<(EnsuredPreparationTranscription, bool), ApplicationError> {
+        loop {
+            let disposition = match job.status {
+                TranscriptionJobStatus::Queued
+                | TranscriptionJobStatus::Extracting
+                | TranscriptionJobStatus::Transcribing
+                | TranscriptionJobStatus::Importing => {
+                    PreparationTranscriptionDisposition::ExistingActive
+                }
+                TranscriptionJobStatus::Completed if self.completed_track_is_reusable(&job)? => {
+                    PreparationTranscriptionDisposition::ReusedCompleted
+                }
+                TranscriptionJobStatus::Completed => {
+                    let expected_status = job.status;
+                    let restarted = reset_preparation_job(job.clone(), now_ms());
+                    match self
+                        .repository
+                        .transition_job(expected_status, &restarted)?
+                    {
+                        TranscriptionJobTransition::Applied(restarted) => {
+                            self.emit(EventName::TranscriptionJobChanged, &restarted);
+                            return Ok((
+                                EnsuredPreparationTranscription {
+                                    disposition:
+                                        PreparationTranscriptionDisposition::RestartedInvalidCompletion,
+                                    job: restarted,
+                                },
+                                true,
+                            ));
+                        }
+                        TranscriptionJobTransition::Rejected(current) => {
+                            job = current;
+                            continue;
+                        }
+                    }
+                }
+                TranscriptionJobStatus::Failed
+                    if job.error_code.as_deref() == Some("interrupted") =>
+                {
+                    let expected_status = job.status;
+                    let restarted = reset_preparation_job(job.clone(), now_ms());
+                    match self
+                        .repository
+                        .transition_job(expected_status, &restarted)?
+                    {
+                        TranscriptionJobTransition::Applied(restarted) => {
+                            self.emit(EventName::TranscriptionJobChanged, &restarted);
+                            return Ok((
+                                EnsuredPreparationTranscription {
+                                    disposition:
+                                        PreparationTranscriptionDisposition::RestartedInterrupted,
+                                    job: restarted,
+                                },
+                                true,
+                            ));
+                        }
+                        TranscriptionJobTransition::Rejected(current) => {
+                            job = current;
+                            continue;
+                        }
+                    }
+                }
+                TranscriptionJobStatus::Cancelled | TranscriptionJobStatus::Failed => {
+                    PreparationTranscriptionDisposition::ExistingTerminal
+                }
+            };
+            return Ok((EnsuredPreparationTranscription { disposition, job }, false));
+        }
+    }
+
+    fn completed_track_is_reusable(
+        &self,
+        job: &TranscriptionJob,
+    ) -> Result<bool, ApplicationError> {
+        let Some(track_id) = job.generated_track_id.as_ref() else {
+            return Ok(false);
+        };
+        let analysis = self.services.media_analysis();
+        let Some(media) = analysis.read_media(&job.media_id)? else {
+            return Ok(false);
+        };
+        if media.fingerprint != job.media_fingerprint
+            || media.availability != MediaAvailability::Available
+        {
+            return Ok(false);
+        }
+        Ok(analysis
+            .read_subtitle_track(track_id)?
+            .is_some_and(|track| {
+                track.media_id == job.media_id && track.status == SubtitleTrackStatus::Available
+            }))
+    }
+
+    fn start_job(self: Arc<Self>, id: TranscriptionJobId) {
+        tokio::spawn(async move { self.run_job(id).await });
     }
 
     pub fn cancel_job(
@@ -856,11 +1263,7 @@ impl TranscriptionCoordinator {
                 media_id: job.media_id.clone(),
                 source_name: format!("ASR-{}.srt", file_id(&model.display_name)),
                 content: srt,
-                language: if job.purpose == TranscriptionPurpose::TranslateToEnglish {
-                    Some("en".into())
-                } else {
-                    job.requested_language.clone()
-                },
+                language: resolved_subtitle_language(&job),
                 identity_salt: Some(format!(
                     "{}:{}:{}",
                     job.provider_id,
@@ -997,6 +1400,33 @@ struct TranscriptionDownloadProgress {
     model_id: TranscriptionModelId,
 }
 
+#[derive(Default)]
+struct PreparationAudioTrackCounter {
+    count: AtomicUsize,
+}
+
+impl PreparationAudioTrackCounter {
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl ProcessOutputObserver for PreparationAudioTrackCounter {
+    fn stdout_line(&self, line: &str) -> Result<(), ApplicationError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        line.parse::<u32>().map_err(|_| {
+            ApplicationError::ExternalProcess(
+                "ffprobe returned an invalid audio stream index".into(),
+            )
+        })?;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 impl DownloadProgress for TranscriptionDownloadProgress {
     fn is_cancelled(&self) -> Result<bool, ApplicationError> {
         Ok(self
@@ -1095,6 +1525,96 @@ fn parse_recording_transcription_json(
         detected_language,
         segments,
     })
+}
+
+fn reset_preparation_job(mut job: TranscriptionJob, updated_at_ms: u64) -> TranscriptionJob {
+    job.status = TranscriptionJobStatus::Queued;
+    job.phase_progress = 0;
+    job.detected_language = None;
+    job.error_code = None;
+    job.error_message = None;
+    job.generated_track_id = None;
+    job.started_at_ms = None;
+    job.completed_at_ms = None;
+    job.updated_at_ms = updated_at_ms;
+    job.archived_at_ms = None;
+    job
+}
+
+fn resolved_subtitle_language(job: &TranscriptionJob) -> Option<String> {
+    if job.purpose == TranscriptionPurpose::TranslateToEnglish {
+        Some("en".into())
+    } else {
+        job.requested_language
+            .clone()
+            .or_else(|| job.detected_language.clone())
+    }
+}
+
+fn select_preparation_model(
+    models: &[TranscriptionModelDescriptor],
+    language: Option<&str>,
+) -> Result<PreparationTranscriptionModelSelection, ApplicationError> {
+    const RECOMMENDED_MODEL_ID: &str = "whisper.cpp:base@main";
+
+    let mut installed = models
+        .iter()
+        .filter(|model| {
+            matches!(
+                model.state,
+                TranscriptionModelState::Installed | TranscriptionModelState::Custom
+            ) && preparation_model_supports_language(model, language)
+        })
+        .collect::<Vec<_>>();
+    installed.sort_by_key(|model| {
+        (
+            model.id.as_str() != RECOMMENDED_MODEL_ID,
+            transcription_quality_rank(model.quality),
+            model.size_bytes,
+            model.id.as_str(),
+        )
+    });
+    if let Some(model) = installed.first() {
+        return Ok(PreparationTranscriptionModelSelection::Ready {
+            model_id: model.id.clone(),
+        });
+    }
+
+    let recommended = models
+        .iter()
+        .find(|model| model.id.as_str() == RECOMMENDED_MODEL_ID)
+        .ok_or(ApplicationError::NotFound(
+            "recommended transcription model",
+        ))?;
+    if recommended.english_only {
+        return Err(ApplicationError::Invalid(
+            "recommended preparation transcription model must be multilingual".into(),
+        ));
+    }
+    Ok(PreparationTranscriptionModelSelection::InstallRecommended {
+        model_id: recommended.id.clone(),
+    })
+}
+
+fn preparation_model_supports_language(
+    model: &TranscriptionModelDescriptor,
+    language: Option<&str>,
+) -> bool {
+    if !model.english_only {
+        return true;
+    }
+    language.is_some_and(|language| {
+        let language = language.trim().to_ascii_lowercase();
+        language == "en" || language.starts_with("en-")
+    })
+}
+
+fn transcription_quality_rank(quality: TranscriptionQuality) -> u8 {
+    match quality {
+        TranscriptionQuality::Fast => 0,
+        TranscriptionQuality::Balanced => 1,
+        TranscriptionQuality::Accurate => 2,
+    }
 }
 
 fn catalog() -> Vec<TranscriptionModelDescriptor> {
@@ -1235,7 +1755,353 @@ fn english_only_model_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FakeProcessRunner;
     use crate::runtime_support::resolve_bundled_tool;
+    use application::{AppServices, ImportSubtitle, RegisterMedia};
+    use domain::MediaKind;
+    use persistence_sqlite::SqliteRepository;
+
+    fn coordinator_fixture(
+        process_runner: Arc<dyn ProcessRunner>,
+        ffprobe: Option<PathBuf>,
+    ) -> (
+        Arc<TranscriptionCoordinator>,
+        Arc<SqliteRepository>,
+        AppServices,
+    ) {
+        let repository = Arc::new(SqliteRepository::in_memory().unwrap());
+        let services = AppServices::new(
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+            repository.clone(),
+        );
+        let (events, _) = broadcast::channel(32);
+        let coordinator = Arc::new(
+            TranscriptionCoordinator::new_with_adapters_and_ffprobe(
+                services.clone(),
+                repository.clone(),
+                events,
+                process_runner,
+                Arc::new(crate::FakeArtifactDownloader::new(Vec::new())),
+                ffprobe,
+            )
+            .unwrap(),
+        );
+        (coordinator, repository, services)
+    }
+
+    fn media_job(
+        id: TranscriptionJobId,
+        media_id: MediaId,
+        media_fingerprint: &str,
+        status: TranscriptionJobStatus,
+    ) -> TranscriptionJob {
+        TranscriptionJob {
+            id,
+            media_id,
+            media_title: "Preparation media".into(),
+            media_fingerprint: media_fingerprint.into(),
+            provider_id: "whisper.cpp".into(),
+            provider_version: "test".into(),
+            runtime_id: "whisper.cpp-cli".into(),
+            runtime_version: "test".into(),
+            model_id: TranscriptionModelId::parse("whisper.cpp:base@main").unwrap(),
+            model_revision: "main-80da2d8".into(),
+            model_checksum_sha256: "checksum".into(),
+            destination: TranscriptionDestination::Primary,
+            purpose: TranscriptionPurpose::Transcribe,
+            requested_language: Some("en".into()),
+            detected_language: Some("en".into()),
+            audio_track: Some(0),
+            settings_json:
+                r#"{"destination":"primary","purpose":"transcribe","language":"en","audio_track":0}"#
+                    .into(),
+            input_fingerprint: "preparation-input".into(),
+            status,
+            phase_progress: if status == TranscriptionJobStatus::Completed {
+                100
+            } else {
+                35
+            },
+            error_code: None,
+            error_message: None,
+            retry_of_job_id: None,
+            generated_track_id: None,
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            completed_at_ms: (status == TranscriptionJobStatus::Completed).then_some(3),
+            updated_at_ms: 3,
+            archived_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn preparation_child_identity_is_deterministic_and_audio_selection_is_typed() {
+        let first = preparation_transcription_child_id("media:audio:policy").unwrap();
+        let second = preparation_transcription_child_id("media:audio:policy").unwrap();
+        assert_eq!(first, second);
+        assert!(preparation_transcription_child_id(" ").is_err());
+        assert_eq!(
+            resolve_preparation_audio_selection(0, None),
+            PreparationAudioSelection::Unavailable {
+                reason: "audio_track_not_found"
+            }
+        );
+        assert_eq!(
+            resolve_preparation_audio_selection(2, None),
+            PreparationAudioSelection::SelectionRequired {
+                reason: "audio_track_required"
+            }
+        );
+        assert_eq!(
+            resolve_preparation_audio_selection(1, None),
+            PreparationAudioSelection::Selected { audio_track: 0 }
+        );
+        assert_eq!(
+            resolve_preparation_audio_selection(1, Some(2)),
+            PreparationAudioSelection::Unavailable {
+                reason: "audio_track_not_found"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_audio_probe_reports_multitrack_selection_without_ffmpeg_defaulting() {
+        let runner = Arc::new(FakeProcessRunner::with_stdout_lines([
+            "0".into(),
+            "1".into(),
+        ]));
+        let (coordinator, _repository, services) =
+            coordinator_fixture(runner.clone(), Some(PathBuf::from("/test/ffprobe")));
+        let media = services
+            .media_analysis()
+            .register_media(RegisterMedia {
+                path: "/test/media.mkv".into(),
+                fingerprint: "audio-probe-media".into(),
+                title: "Audio probe".into(),
+                kind: MediaKind::Video,
+                duration_ms: Some(1_000),
+            })
+            .unwrap();
+
+        assert_eq!(
+            coordinator
+                .resolve_preparation_audio_track(&media.id, None)
+                .await
+                .unwrap(),
+            PreparationAudioSelection::SelectionRequired {
+                reason: "audio_track_required"
+            }
+        );
+        assert_eq!(
+            coordinator
+                .resolve_preparation_audio_track(&media.id, Some(1))
+                .await
+                .unwrap(),
+            PreparationAudioSelection::Selected { audio_track: 1 }
+        );
+        assert_eq!(runner.calls()[0].executable, PathBuf::from("/test/ffprobe"));
+    }
+
+    #[test]
+    fn preparation_claim_reuses_valid_completion_and_restarts_invalid_or_interrupted_child() {
+        let (coordinator, repository, services) =
+            coordinator_fixture(Arc::new(FakeProcessRunner::succeeding()), None);
+        let media = services
+            .media_analysis()
+            .register_media(RegisterMedia {
+                path: "/test/media.mkv".into(),
+                fingerprint: "preparation-media".into(),
+                title: "Preparation".into(),
+                kind: MediaKind::Video,
+                duration_ms: Some(1_000),
+            })
+            .unwrap();
+        let track = services
+            .media_analysis()
+            .import_subtitle(ImportSubtitle {
+                media_id: media.id.clone(),
+                source_name: "asr.srt".into(),
+                content: b"1\n00:00:00,000 --> 00:00:00,900\nHello.\n".to_vec(),
+                language: Some("en".into()),
+                identity_salt: Some("preparation-input".into()),
+            })
+            .unwrap();
+
+        let completed_id = preparation_transcription_child_id("completed-child").unwrap();
+        let mut completed = media_job(
+            completed_id,
+            media.id.clone(),
+            &media.fingerprint,
+            TranscriptionJobStatus::Completed,
+        );
+        completed.generated_track_id = Some(track.id.clone());
+        repository.create_job(&completed).unwrap();
+        let candidate = completed.clone();
+
+        let (reused, should_start) = coordinator
+            .claim_preparation_job(candidate.clone())
+            .unwrap();
+        assert_eq!(
+            reused.disposition,
+            PreparationTranscriptionDisposition::ReusedCompleted
+        );
+        assert!(!should_start);
+
+        services
+            .media_analysis()
+            .archive_subtitle_track(&track.id)
+            .unwrap();
+        let (restarted, should_start) = coordinator.claim_preparation_job(candidate).unwrap();
+        assert_eq!(
+            restarted.disposition,
+            PreparationTranscriptionDisposition::RestartedInvalidCompletion
+        );
+        assert_eq!(restarted.job.id, completed.id);
+        assert_eq!(restarted.job.status, TranscriptionJobStatus::Queued);
+        assert!(restarted.job.generated_track_id.is_none());
+        assert!(should_start);
+
+        let interrupted_id = preparation_transcription_child_id("interrupted-child").unwrap();
+        let mut interrupted = media_job(
+            interrupted_id,
+            media.id,
+            &media.fingerprint,
+            TranscriptionJobStatus::Failed,
+        );
+        interrupted.error_code = Some("interrupted".into());
+        interrupted.error_message = Some("service stopped".into());
+        repository.create_job(&interrupted).unwrap();
+        let (restarted, should_start) = coordinator
+            .claim_preparation_job(interrupted.clone())
+            .unwrap();
+        assert_eq!(
+            restarted.disposition,
+            PreparationTranscriptionDisposition::RestartedInterrupted
+        );
+        assert_eq!(restarted.job.id, interrupted.id);
+        assert_eq!(restarted.job.status, TranscriptionJobStatus::Queued);
+        assert!(restarted.job.error_code.is_none());
+        assert!(should_start);
+    }
+
+    #[tokio::test]
+    async fn preparation_ensure_restarts_existing_child_without_reselecting_model() {
+        let (coordinator, repository, services) =
+            coordinator_fixture(Arc::new(FakeProcessRunner::succeeding()), None);
+        let media = services
+            .media_analysis()
+            .register_media(RegisterMedia {
+                path: "/test/media.mkv".into(),
+                fingerprint: "existing-child-media".into(),
+                title: "Preparation".into(),
+                kind: MediaKind::Video,
+                duration_ms: Some(1_000),
+            })
+            .unwrap();
+        let idempotency_key = "existing-interrupted-child";
+        let child_id = preparation_transcription_child_id(idempotency_key).unwrap();
+        let mut interrupted = media_job(
+            child_id.clone(),
+            media.id.clone(),
+            &media.fingerprint,
+            TranscriptionJobStatus::Failed,
+        );
+        interrupted.error_code = Some("interrupted".into());
+        interrupted.error_message = Some("service stopped".into());
+        repository.create_job(&interrupted).unwrap();
+
+        // Change the current automatic policy after the child was created.
+        // Recovery must retain the child's persisted model and provenance.
+        let mut old_model = repository
+            .get_model(&interrupted.model_id)
+            .unwrap()
+            .unwrap();
+        old_model.state = TranscriptionModelState::Downloadable;
+        repository.upsert_model(&old_model).unwrap();
+        let preferred_id = TranscriptionModelId::parse("whisper.cpp:small.en@main").unwrap();
+        let mut newly_preferred = repository.get_model(&preferred_id).unwrap().unwrap();
+        newly_preferred.state = TranscriptionModelState::Installed;
+        repository.upsert_model(&newly_preferred).unwrap();
+
+        let ensured = coordinator
+            .ensure_preparation_transcription(EnsurePreparationTranscriptionRequest {
+                idempotency_key: idempotency_key.into(),
+                child_id,
+                media_id: media.id,
+                language: Some("en".into()),
+                audio_track: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ensured.disposition,
+            PreparationTranscriptionDisposition::RestartedInterrupted
+        );
+        assert_eq!(ensured.job.id, interrupted.id);
+        assert_eq!(ensured.job.model_id, interrupted.model_id);
+        assert_eq!(ensured.job.input_fingerprint, interrupted.input_fingerprint);
+        assert_eq!(ensured.job.status, TranscriptionJobStatus::Queued);
+    }
+
+    #[test]
+    fn preparation_model_policy_prefers_compatible_installed_then_multilingual_base() {
+        let mut models = catalog();
+        let english = models
+            .iter_mut()
+            .find(|model| model.id.as_str() == "whisper.cpp:small.en@main")
+            .unwrap();
+        english.state = TranscriptionModelState::Installed;
+        let english_id = english.id.clone();
+        assert_eq!(
+            select_preparation_model(&models, Some("en")).unwrap(),
+            PreparationTranscriptionModelSelection::Ready {
+                model_id: english_id
+            }
+        );
+        assert_eq!(
+            select_preparation_model(&models, Some("zh")).unwrap(),
+            PreparationTranscriptionModelSelection::InstallRecommended {
+                model_id: TranscriptionModelId::parse("whisper.cpp:base@main").unwrap()
+            }
+        );
+
+        let multilingual = models
+            .iter_mut()
+            .find(|model| model.id.as_str() == "whisper.cpp:small@main")
+            .unwrap();
+        multilingual.state = TranscriptionModelState::Installed;
+        let multilingual_id = multilingual.id.clone();
+        assert_eq!(
+            select_preparation_model(&models, Some("zh")).unwrap(),
+            PreparationTranscriptionModelSelection::Ready {
+                model_id: multilingual_id
+            }
+        );
+    }
+
+    #[test]
+    fn subtitle_import_uses_detected_language_when_asr_language_was_automatic() {
+        let mut job = media_job(
+            TranscriptionJobId::parse("automatic-language").unwrap(),
+            MediaId::parse("media").unwrap(),
+            "media-fingerprint",
+            TranscriptionJobStatus::Transcribing,
+        );
+        job.requested_language = None;
+        job.detected_language = Some("ja".into());
+
+        assert_eq!(resolved_subtitle_language(&job).as_deref(), Some("ja"));
+
+        job.purpose = TranscriptionPurpose::TranslateToEnglish;
+        assert_eq!(resolved_subtitle_language(&job).as_deref(), Some("en"));
+    }
 
     #[test]
     fn resolves_development_runtime_from_repository_root() {

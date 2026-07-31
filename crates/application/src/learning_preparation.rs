@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ApplicationError;
 
-const FOUNDATION_PLANNER_VERSION: &str = "foundation-v2";
+const FOUNDATION_PLANNER_VERSION: &str = "foundation-v3";
+const LEGACY_FOUNDATION_PLANNER_VERSION: &str = "foundation-v2";
 const INPUTS_CHANGED_ERROR: &str = "preparation inputs or plan changed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,7 +39,13 @@ pub struct FoundationPreparationTarget {
     pub media_id: MediaId,
     pub media_fingerprint: String,
     pub subtitle_track_id: SubtitleTrackId,
+    /// Raw imported-track fingerprint. This preserves source/provenance
+    /// identity but does not cover later language correction or retokenization.
     pub subtitle_fingerprint: String,
+    /// Canonical language, cue, text, and token snapshot consumed by the
+    /// downstream foundation analyses.
+    #[serde(default)]
+    pub subtitle_text_fingerprint: String,
 }
 
 impl FoundationPreparationTarget {
@@ -50,6 +57,20 @@ impl FoundationPreparationTarget {
     }
 
     pub fn input_fingerprint(&self) -> String {
+        // Runs created before the canonical text snapshot was added must remain
+        // readable and transitionable so startup recovery can fail them
+        // safely. New preparation requests reject an empty snapshot below.
+        if self.subtitle_text_fingerprint.is_empty() {
+            return digest_fields(
+                LEGACY_FOUNDATION_PLANNER_VERSION,
+                &[
+                    self.media_id.as_str(),
+                    &self.media_fingerprint,
+                    self.subtitle_track_id.as_str(),
+                    &self.subtitle_fingerprint,
+                ],
+            );
+        }
         digest_fields(
             FOUNDATION_PLANNER_VERSION,
             &[
@@ -57,12 +78,16 @@ impl FoundationPreparationTarget {
                 &self.media_fingerprint,
                 self.subtitle_track_id.as_str(),
                 &self.subtitle_fingerprint,
+                &self.subtitle_text_fingerprint,
             ],
         )
     }
 
     fn validate(&self) -> Result<(), ApplicationError> {
-        if self.media_fingerprint.trim().is_empty() || self.subtitle_fingerprint.trim().is_empty() {
+        if self.media_fingerprint.trim().is_empty()
+            || self.subtitle_fingerprint.trim().is_empty()
+            || self.subtitle_text_fingerprint.trim().is_empty()
+        {
             return Err(ApplicationError::Invalid(
                 "preparation target fingerprints must not be empty".into(),
             ));
@@ -1028,6 +1053,7 @@ mod tests {
                 media_fingerprint: "media-fp".into(),
                 subtitle_track_id: SubtitleTrackId::parse("track").unwrap(),
                 subtitle_fingerprint: "subtitle-fp".into(),
+                subtitle_text_fingerprint: "subtitle-text-fp".into(),
             },
             target_key: "target".into(),
             input_fingerprint: "input".into(),

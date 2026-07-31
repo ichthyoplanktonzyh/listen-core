@@ -62,6 +62,13 @@ impl MediaAnalysisUseCases {
         self.subtitle_tracks.get_track(track_id)
     }
 
+    pub fn list_subtitle_tracks(
+        &self,
+        media_id: &crate::MediaId,
+    ) -> Result<Vec<SubtitleTrack>, ApplicationError> {
+        self.subtitle_tracks.list_tracks_for_media(media_id)
+    }
+
     pub fn read_sentence(
         &self,
         sentence_id: &SubtitleSentenceId,

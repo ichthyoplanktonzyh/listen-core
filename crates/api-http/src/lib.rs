@@ -41,9 +41,9 @@ mod secret_store_keychain;
 use application_executor::ApplicationExecutor;
 use local_runtime::{
     CreateJobRequest, CreatePhoneticJobRequest, CreateSoundLineJob, CreateSpeechBatchJob,
-    LearningPreparationCoordinator, LearningResourceManager, PhoneticAnalysisCoordinator,
-    SoundLineCoordinator, SpeechBatchCoordinator, SpeechSynthesisManager,
-    SubtitleSearchCoordinator, TranscriptionCoordinator,
+    LearningPreparationCoordinator, LearningResourceManager, MediaLearningPreparationCoordinator,
+    PhoneticAnalysisCoordinator, SoundLineCoordinator, SpeechBatchCoordinator,
+    SpeechSynthesisManager, SubtitleSearchCoordinator, TranscriptionCoordinator,
 };
 pub use local_runtime::{SyntaxCapabilityManager, SyntaxCapabilityStatus, SyntaxCapabilityView};
 pub use secret_store_keychain::KeychainSecretStore;
@@ -64,6 +64,7 @@ pub struct AnalysisRuntime {
     pub speech_jobs: Arc<SpeechBatchCoordinator>,
     pub sound_line: Arc<SoundLineCoordinator>,
     pub foundation_preparation: Arc<LearningPreparationCoordinator>,
+    pub media_learning_preparation: Arc<MediaLearningPreparationCoordinator>,
 }
 
 #[derive(Clone)]
@@ -119,6 +120,7 @@ impl ApiState {
             + application::PhoneticAnalysisRepository
             + application::BackgroundJobStore
             + application::LearningPreparationRunRepository
+            + application::MediaLearningPreparationRepository
             + 'static,
     {
         let (events, _) = broadcast::channel(128);
@@ -160,6 +162,13 @@ impl ApiState {
         let foundation_preparation =
             LearningPreparationCoordinator::new(services.clone(), repository.clone())
                 .expect("learning preparation coordinator must initialize");
+        let media_learning_preparation = MediaLearningPreparationCoordinator::new(
+            services.clone(),
+            repository.clone(),
+            transcription.clone(),
+            foundation_preparation.clone(),
+        )
+        .expect("media learning preparation coordinator must initialize");
         Self {
             application: ApplicationExecutor::new(services.clone()),
             analysis: AnalysisRuntime {
@@ -168,6 +177,7 @@ impl ApiState {
                 speech_jobs,
                 sound_line,
                 foundation_preparation,
+                media_learning_preparation,
             },
             language: LanguageRuntime {
                 dictionaries: Arc::new(vec![

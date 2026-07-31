@@ -30,7 +30,7 @@ impl MediaAnalysisUseCases {
             .subtitle_tracks
             .get_track(track_id)?
             .ok_or(ApplicationError::NotFound("subtitle track"))?;
-        canonical_foundation_input_fingerprint(&track, None)
+        foundation_text_snapshot_fingerprint(&track)
     }
 
     /// Canonical subtitle + phrase-analysis snapshot for chunk and rule
@@ -447,6 +447,16 @@ impl MediaAnalysisUseCases {
     }
 }
 
+/// Canonical Subtitle Text Track snapshot consumed by foundation preparation.
+///
+/// Unlike `SubtitleTrack::fingerprint`, this covers language correction,
+/// retokenization, cue boundaries, and normalized text/token content.
+pub fn foundation_text_snapshot_fingerprint(
+    track: &SubtitleTrack,
+) -> Result<String, ApplicationError> {
+    canonical_foundation_input_fingerprint(track, None)
+}
+
 fn canonical_foundation_input_fingerprint(
     track: &SubtitleTrack,
     phrase_candidates: Option<&[Vec<domain::PhraseCandidate>]>,
@@ -736,10 +746,9 @@ mod foundation_fingerprint_tests {
         let phrase_a = vec![vec![phrase("Hello")]];
         let phrase_b = vec![vec![phrase("Hello there")]];
 
-        let text = canonical_foundation_input_fingerprint(&original, None).unwrap();
-        let text_after_phrase_update =
-            canonical_foundation_input_fingerprint(&original, None).unwrap();
-        let changed_text = canonical_foundation_input_fingerprint(&changed_token, None).unwrap();
+        let text = foundation_text_snapshot_fingerprint(&original).unwrap();
+        let text_after_phrase_update = foundation_text_snapshot_fingerprint(&original).unwrap();
+        let changed_text = foundation_text_snapshot_fingerprint(&changed_token).unwrap();
         let analysis_a =
             canonical_foundation_input_fingerprint(&original, Some(&phrase_a)).unwrap();
         let analysis_b =
@@ -760,7 +769,22 @@ mod foundation_fingerprint_tests {
 
         assert_eq!(
             canonical_foundation_input_fingerprint(&left, None).unwrap(),
-            canonical_foundation_input_fingerprint(&right, None).unwrap()
+            foundation_text_snapshot_fingerprint(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn language_correction_changes_the_text_snapshot_without_changing_raw_fingerprint() {
+        let original = track("Hello");
+        let mut corrected = original.clone();
+        corrected.language = Some(LanguageCode::parse("zh").unwrap());
+        corrected.sentences[0].tokens =
+            subtitle_core::tokenize(corrected.language.as_ref(), "Hello");
+
+        assert_eq!(original.fingerprint, corrected.fingerprint);
+        assert_ne!(
+            foundation_text_snapshot_fingerprint(&original).unwrap(),
+            foundation_text_snapshot_fingerprint(&corrected).unwrap()
         );
     }
 }

@@ -10,6 +10,7 @@ mod download;
 mod forced_align;
 mod learning_preparation;
 mod learning_resources;
+mod media_learning_preparation;
 mod phonetic_analysis;
 mod process;
 mod realtime_cascade;
@@ -27,6 +28,7 @@ pub use download::{
 pub use forced_align::{SidecarForcedAlignProvider, resolved_forced_align_provider};
 pub use learning_preparation::LearningPreparationCoordinator;
 pub use learning_resources::{LearningResourceError, LearningResourceManager};
+pub use media_learning_preparation::MediaLearningPreparationCoordinator;
 pub use phonetic_analysis::{CreatePhoneticJobRequest, PhoneticAnalysisCoordinator, finding_id};
 pub use process::{
     CancellationProbe, FakeProcessRunner, IgnoreProcessOutput, NeverCancelled,
@@ -53,5 +55,9 @@ pub use syntax_capability::{
     SyntaxCapabilityStatus, SyntaxCapabilityView,
 };
 pub use transcription::{
-    CreateJobRequest, CreateRecordingTranscriptionRequest, TranscriptionCoordinator,
+    CreateJobRequest, CreateRecordingTranscriptionRequest, EnsurePreparationTranscriptionRequest,
+    EnsuredPreparationTranscription, PreparationAudioSelection,
+    PreparationTranscriptionDisposition, PreparationTranscriptionModelSelection,
+    TranscriptionCoordinator, preparation_transcription_child_id,
+    resolve_preparation_audio_selection,
 };

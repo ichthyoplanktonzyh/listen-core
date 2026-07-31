@@ -134,10 +134,17 @@ Sense Group analysis, including the citation and predicted audible structures
 used by the first two listening-flow views.
 _Avoid_: Every possible analysis, technical resource center, optional enhancement
 
+**Content Preparation**:
+A learner-requested operation that makes one Content Document ready for
+standard learning activities; the system resolves the usable Subtitle Text
+Track and Foundation Resource Set without asking the learner to manage models,
+timelines, or individual resources.
+_Avoid_: Resource generation, model setup, timeline editing, technical resource center
+
 **Foundation Preparation**:
-A learner-requested operation that reuses or creates the missing members of a
-Foundation Resource Set for one Content Document.
-_Avoid_: Resource installation, generate everything, analysis upgrade
+The internal preparation stage that reuses or creates the missing members of a
+Foundation Resource Set after a Subtitle Text Track has been resolved.
+_Avoid_: Content Preparation, resource installation, analysis upgrade
 
 **Phoneme Analysis**:
 An optional, comparatively expensive Analysis Resource that explains speech at
