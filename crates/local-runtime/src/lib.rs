@@ -55,9 +55,5 @@ pub use syntax_capability::{
     SyntaxCapabilityStatus, SyntaxCapabilityView,
 };
 pub use transcription::{
-    CreateJobRequest, CreateRecordingTranscriptionRequest, EnsurePreparationTranscriptionRequest,
-    EnsuredPreparationTranscription, PreparationAudioSelection,
-    PreparationTranscriptionDisposition, PreparationTranscriptionModelSelection,
-    TranscriptionCoordinator, preparation_transcription_child_id,
-    resolve_preparation_audio_selection,
+    CreateJobRequest, CreateRecordingTranscriptionRequest, TranscriptionCoordinator,
 };

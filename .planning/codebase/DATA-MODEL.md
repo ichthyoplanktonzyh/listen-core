@@ -48,7 +48,9 @@ Key invariants:
   stores media and learning-language intent, the resolved existing/ASR subtitle
   source, exact frozen Subtitle Text Track snapshot, ASR and foundation child
   provenance, revision, and retry lineage. Its SQLite partial unique index
-  permits only one active preparation for a Content Document target;
+  permits only one active preparation for a Content Document target. A resolved
+  ASR source contains a typed audio-stream index, and retry reuses the child
+  identity derived from the stable preparation input;
 - destructive migration or cascade behavior requires explicit requirement,
   tests, and release/migration notes.
 

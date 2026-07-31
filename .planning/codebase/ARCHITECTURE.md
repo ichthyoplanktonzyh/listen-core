@@ -55,8 +55,10 @@ foundation preparation. The runtime chooses or installs its recommended ASR
 model internally; model identity, individual analysis resources, and timeline
 management are not learner decisions. Ambiguous subtitle or audio sources
 return a typed selection requirement instead of silently choosing a stream.
-SoundLine and the separately confirmed Phoneme Analysis are not children of
-this parent.
+The resolved audio index is an internal value object, and the ASR child identity
+is derived from the frozen preparation input so explicit retry restarts the
+same durable child rather than adding another job. SoundLine and the separately
+confirmed Phoneme Analysis are not children of this parent.
 
 Foundation learning preparation is a separate application module rather than a
 new generic background-job kind. Its interface accepts an exact media,

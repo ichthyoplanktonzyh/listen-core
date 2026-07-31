@@ -67,44 +67,52 @@ pub struct CreateRecordingTranscriptionRequest {
 /// calling this seam; the ASR operation always transcribes the selected source
 /// language and never claims subtitle-selection authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnsurePreparationTranscriptionRequest {
-    pub idempotency_key: String,
-    pub child_id: TranscriptionJobId,
-    pub media_id: MediaId,
-    pub language: Option<String>,
-    pub audio_track: u32,
+pub(crate) struct EnsurePreparationTranscriptionRequest {
+    pub(crate) idempotency_key: String,
+    pub(crate) child_id: TranscriptionJobId,
+    pub(crate) media_id: MediaId,
+    pub(crate) language: Option<String>,
+    pub(crate) audio_track: u32,
+    pub(crate) terminal_policy: PreparationTranscriptionTerminalPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreparationTranscriptionDisposition {
+pub(crate) enum PreparationTranscriptionTerminalPolicy {
+    Preserve,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationTranscriptionDisposition {
     Created,
     ExistingActive,
     ReusedCompleted,
     RestartedInterrupted,
     RestartedInvalidCompletion,
+    RestartedExplicitRetry,
     ExistingTerminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnsuredPreparationTranscription {
-    pub disposition: PreparationTranscriptionDisposition,
-    pub job: TranscriptionJob,
+pub(crate) struct EnsuredPreparationTranscription {
+    pub(crate) disposition: PreparationTranscriptionDisposition,
+    pub(crate) job: TranscriptionJob,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparationAudioSelection {
+pub(crate) enum PreparationAudioSelection {
     Selected { audio_track: u32 },
     SelectionRequired { reason: &'static str },
     Unavailable { reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparationTranscriptionModelSelection {
+pub(crate) enum PreparationTranscriptionModelSelection {
     Ready { model_id: TranscriptionModelId },
     InstallRecommended { model_id: TranscriptionModelId },
 }
 
-pub fn preparation_transcription_child_id(
+pub(crate) fn preparation_transcription_child_id(
     idempotency_key: &str,
 ) -> Result<TranscriptionJobId, ApplicationError> {
     if idempotency_key.trim().is_empty() {
@@ -118,7 +126,7 @@ pub fn preparation_transcription_child_id(
     ))
 }
 
-pub fn resolve_preparation_audio_selection(
+pub(crate) fn resolve_preparation_audio_selection(
     audio_track_count: usize,
     requested_audio_track: Option<u32>,
 ) -> PreparationAudioSelection {
@@ -557,7 +565,7 @@ impl TranscriptionCoordinator {
 
     /// Probe the exact media before ASR so a missing or ambiguous audio stream
     /// becomes a typed preparation result instead of an ffmpeg default.
-    pub async fn resolve_preparation_audio_track(
+    pub(crate) async fn resolve_preparation_audio_track(
         &self,
         media_id: &MediaId,
         requested_audio_track: Option<u32>,
@@ -615,7 +623,7 @@ impl TranscriptionCoordinator {
     /// media-preparation run. Public transcription endpoints keep their
     /// existing timestamped create/retry behavior; only this seam reuses a
     /// caller-chosen child identity and restarts interrupted work in place.
-    pub async fn ensure_preparation_transcription(
+    pub(crate) async fn ensure_preparation_transcription(
         self: &Arc<Self>,
         request: EnsurePreparationTranscriptionRequest,
     ) -> Result<EnsuredPreparationTranscription, ApplicationError> {
@@ -627,7 +635,8 @@ impl TranscriptionCoordinator {
         }
         if let Some(existing) = self.repository.get_job(&request.child_id)? {
             self.validate_existing_preparation_job(&existing, &request)?;
-            let (ensured, should_start) = self.claim_existing_preparation_job(existing)?;
+            let (ensured, should_start) =
+                self.claim_existing_preparation_job(existing, request.terminal_policy)?;
             if should_start {
                 self.clone().start_job(ensured.job.id.clone());
             }
@@ -656,7 +665,8 @@ impl TranscriptionCoordinator {
             None,
             Some(request.child_id),
         )?;
-        let (ensured, should_start) = self.claim_preparation_job(candidate)?;
+        let (ensured, should_start) =
+            self.claim_preparation_job(candidate, request.terminal_policy)?;
         if should_start {
             self.clone().start_job(ensured.job.id.clone());
         }
@@ -690,7 +700,7 @@ impl TranscriptionCoordinator {
         Ok(())
     }
 
-    pub fn recommended_preparation_model(
+    pub(crate) fn recommended_preparation_model(
         &self,
         language: Option<&str>,
     ) -> Result<PreparationTranscriptionModelSelection, ApplicationError> {
@@ -810,6 +820,7 @@ impl TranscriptionCoordinator {
     fn claim_preparation_job(
         &self,
         candidate: TranscriptionJob,
+        terminal_policy: PreparationTranscriptionTerminalPolicy,
     ) -> Result<(EnsuredPreparationTranscription, bool), ApplicationError> {
         let job = match self.repository.create_job_if_absent(&candidate)? {
             CreateTranscriptionJob::Created(job) => {
@@ -833,12 +844,13 @@ impl TranscriptionCoordinator {
                 "preparation transcription idempotency key is already bound to different inputs",
             ));
         }
-        self.claim_existing_preparation_job(job)
+        self.claim_existing_preparation_job(job, terminal_policy)
     }
 
     fn claim_existing_preparation_job(
         &self,
         mut job: TranscriptionJob,
+        terminal_policy: PreparationTranscriptionTerminalPolicy,
     ) -> Result<(EnsuredPreparationTranscription, bool), ApplicationError> {
         loop {
             let disposition = match job.status {
@@ -890,6 +902,32 @@ impl TranscriptionCoordinator {
                                 EnsuredPreparationTranscription {
                                     disposition:
                                         PreparationTranscriptionDisposition::RestartedInterrupted,
+                                    job: restarted,
+                                },
+                                true,
+                            ));
+                        }
+                        TranscriptionJobTransition::Rejected(current) => {
+                            job = current;
+                            continue;
+                        }
+                    }
+                }
+                TranscriptionJobStatus::Cancelled | TranscriptionJobStatus::Failed
+                    if terminal_policy == PreparationTranscriptionTerminalPolicy::Restart =>
+                {
+                    let expected_status = job.status;
+                    let restarted = reset_preparation_job(job.clone(), now_ms());
+                    match self
+                        .repository
+                        .transition_job(expected_status, &restarted)?
+                    {
+                        TranscriptionJobTransition::Applied(restarted) => {
+                            self.emit(EventName::TranscriptionJobChanged, &restarted);
+                            return Ok((
+                                EnsuredPreparationTranscription {
+                                    disposition:
+                                        PreparationTranscriptionDisposition::RestartedExplicitRetry,
                                     job: restarted,
                                 },
                                 true,
@@ -1945,7 +1983,10 @@ mod tests {
         let candidate = completed.clone();
 
         let (reused, should_start) = coordinator
-            .claim_preparation_job(candidate.clone())
+            .claim_preparation_job(
+                candidate.clone(),
+                PreparationTranscriptionTerminalPolicy::Preserve,
+            )
             .unwrap();
         assert_eq!(
             reused.disposition,
@@ -1957,7 +1998,9 @@ mod tests {
             .media_analysis()
             .archive_subtitle_track(&track.id)
             .unwrap();
-        let (restarted, should_start) = coordinator.claim_preparation_job(candidate).unwrap();
+        let (restarted, should_start) = coordinator
+            .claim_preparation_job(candidate, PreparationTranscriptionTerminalPolicy::Preserve)
+            .unwrap();
         assert_eq!(
             restarted.disposition,
             PreparationTranscriptionDisposition::RestartedInvalidCompletion
@@ -1970,7 +2013,7 @@ mod tests {
         let interrupted_id = preparation_transcription_child_id("interrupted-child").unwrap();
         let mut interrupted = media_job(
             interrupted_id,
-            media.id,
+            media.id.clone(),
             &media.fingerprint,
             TranscriptionJobStatus::Failed,
         );
@@ -1978,7 +2021,10 @@ mod tests {
         interrupted.error_message = Some("service stopped".into());
         repository.create_job(&interrupted).unwrap();
         let (restarted, should_start) = coordinator
-            .claim_preparation_job(interrupted.clone())
+            .claim_preparation_job(
+                interrupted.clone(),
+                PreparationTranscriptionTerminalPolicy::Preserve,
+            )
             .unwrap();
         assert_eq!(
             restarted.disposition,
@@ -1988,6 +2034,44 @@ mod tests {
         assert_eq!(restarted.job.status, TranscriptionJobStatus::Queued);
         assert!(restarted.job.error_code.is_none());
         assert!(should_start);
+
+        let failed_id = preparation_transcription_child_id("failed-child").unwrap();
+        let mut failed = media_job(
+            failed_id,
+            media.id,
+            &media.fingerprint,
+            TranscriptionJobStatus::Failed,
+        );
+        failed.error_code = Some("provider_failed".into());
+        repository.create_job(&failed).unwrap();
+        let job_count = repository.list_jobs().unwrap().len();
+
+        let (preserved, should_start) = coordinator
+            .claim_preparation_job(
+                failed.clone(),
+                PreparationTranscriptionTerminalPolicy::Preserve,
+            )
+            .unwrap();
+        assert_eq!(
+            preserved.disposition,
+            PreparationTranscriptionDisposition::ExistingTerminal
+        );
+        assert!(!should_start);
+
+        let (restarted, should_start) = coordinator
+            .claim_preparation_job(
+                failed.clone(),
+                PreparationTranscriptionTerminalPolicy::Restart,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.disposition,
+            PreparationTranscriptionDisposition::RestartedExplicitRetry
+        );
+        assert_eq!(restarted.job.id, failed.id);
+        assert_eq!(restarted.job.status, TranscriptionJobStatus::Queued);
+        assert!(should_start);
+        assert_eq!(repository.list_jobs().unwrap().len(), job_count);
     }
 
     #[tokio::test]
@@ -2036,6 +2120,7 @@ mod tests {
                 media_id: media.id,
                 language: Some("en".into()),
                 audio_track: 0,
+                terminal_policy: PreparationTranscriptionTerminalPolicy::Preserve,
             })
             .await
             .unwrap();

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use application::{
-    FoundationPreparationChildRef, LearningPreparationRunId, MediaLearningPreparationCommand,
-    MediaLearningPreparationInspector, MediaLearningPreparationRepository,
-    MediaLearningPreparationRequest, MediaLearningPreparationSelectionRequired,
-    MediaLearningPreparationSourceInspection, MediaLearningPreparationStatus,
-    MediaLearningPreparationTarget, MediaLearningPreparationTransition,
-    MediaLearningPreparationUseCases, PrepareMediaLearningResult, SubtitleTextTrackSlot,
-    SubtitleTextTrackSnapshot,
+    FoundationPreparationChildRef, LearningPreparationRunId, MediaAudioTrackIndex,
+    MediaLearningPreparationCommand, MediaLearningPreparationInspector,
+    MediaLearningPreparationRepository, MediaLearningPreparationRequest,
+    MediaLearningPreparationSelectionRequired, MediaLearningPreparationSourceInspection,
+    MediaLearningPreparationStatus, MediaLearningPreparationTarget,
+    MediaLearningPreparationTransition, MediaLearningPreparationUseCases,
+    PrepareMediaLearningResult, SubtitleTextTrackSlot, SubtitleTextTrackSnapshot,
 };
 use domain::{LanguageCode, MediaId, SubtitleTrackId};
 
@@ -49,7 +49,11 @@ impl MediaLearningPreparationInspector for AsrInspector {
         request: &MediaLearningPreparationRequest,
     ) -> Result<MediaLearningPreparationSourceInspection, application::ApplicationError> {
         Ok(MediaLearningPreparationSourceInspection::Asr {
-            audio_track: request.explicit_audio_track,
+            audio_track: Some(
+                request
+                    .explicit_audio_track
+                    .unwrap_or_else(|| MediaAudioTrackIndex::new(0)),
+            ),
         })
     }
 }
@@ -322,7 +326,7 @@ fn async_coordinator_can_submit_resolved_audio_without_changing_the_intent_reque
             target("media-fp"),
             intent.clone(),
             MediaLearningPreparationSourceInspection::Asr {
-                audio_track: Some(3),
+                audio_track: Some(MediaAudioTrackIndex::new(3)),
             },
             100,
         )
@@ -336,8 +340,8 @@ fn async_coordinator_can_submit_resolved_audio_without_changing_the_intent_reque
     assert!(matches!(
         run.subtitle_text_track,
         SubtitleTextTrackSlot::AsrChild {
-            audio_track: Some(3),
+            audio_track,
             ..
-        }
+        } if audio_track == MediaAudioTrackIndex::new(3)
     ));
 }

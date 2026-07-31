@@ -5,13 +5,14 @@ use std::time::Duration;
 use application::{
     AppServices, ApplicationError, FoundationPreparationChildRef, FoundationPreparationIntent,
     FoundationPreparationRequest, FoundationPreparationSlot, FoundationPreparationTarget,
-    LearningPreparationRunId, LearningPreparationRunStatus, MediaLearningPreparation,
-    MediaLearningPreparationCommand, MediaLearningPreparationId, MediaLearningPreparationInspector,
-    MediaLearningPreparationRepository, MediaLearningPreparationRequest,
-    MediaLearningPreparationSelectionRequired, MediaLearningPreparationSourceInspection,
-    MediaLearningPreparationStatus, MediaLearningPreparationTarget,
-    MediaLearningPreparationUseCases, PrepareFoundationResult, PrepareMediaLearningResult,
-    SubtitleTextTrackSlot, SubtitleTextTrackSnapshot, foundation_text_snapshot_fingerprint, now_ms,
+    LearningPreparationRunId, LearningPreparationRunStatus, MediaAudioTrackIndex,
+    MediaLearningPreparation, MediaLearningPreparationCommand, MediaLearningPreparationId,
+    MediaLearningPreparationInspector, MediaLearningPreparationRepository,
+    MediaLearningPreparationRequest, MediaLearningPreparationSelectionRequired,
+    MediaLearningPreparationSourceInspection, MediaLearningPreparationStatus,
+    MediaLearningPreparationTarget, MediaLearningPreparationUseCases, PrepareFoundationResult,
+    PrepareMediaLearningResult, SubtitleTextTrackSlot, SubtitleTextTrackSnapshot,
+    foundation_text_snapshot_fingerprint, now_ms,
 };
 use async_trait::async_trait;
 use domain::{
@@ -19,10 +20,11 @@ use domain::{
     TranscriptionJobStatus,
 };
 
-use crate::{
-    EnsurePreparationTranscriptionRequest, LearningPreparationCoordinator,
-    PreparationAudioSelection, TranscriptionCoordinator, preparation_transcription_child_id,
+use crate::transcription::{
+    EnsurePreparationTranscriptionRequest, PreparationAudioSelection,
+    PreparationTranscriptionTerminalPolicy, preparation_transcription_child_id,
 };
+use crate::{LearningPreparationCoordinator, TranscriptionCoordinator};
 
 #[cfg(not(test))]
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -133,12 +135,6 @@ fn track_has_text(track: &SubtitleTrack) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct FoundationChild {
-    run_id: LearningPreparationRunId,
-    input_fingerprint: String,
-}
-
-#[derive(Debug, Clone)]
 enum FoundationChildState {
     Active,
     Completed,
@@ -150,7 +146,7 @@ trait FoundationRuntime: Send + Sync {
     fn prepare(
         &self,
         target: FoundationPreparationTarget,
-    ) -> Result<FoundationChild, ApplicationError>;
+    ) -> Result<FoundationPreparationChildRef, ApplicationError>;
     fn state(
         &self,
         id: &LearningPreparationRunId,
@@ -162,7 +158,7 @@ impl FoundationRuntime for Arc<LearningPreparationCoordinator> {
     fn prepare(
         &self,
         target: FoundationPreparationTarget,
-    ) -> Result<FoundationChild, ApplicationError> {
+    ) -> Result<FoundationPreparationChildRef, ApplicationError> {
         let result = LearningPreparationCoordinator::prepare(
             self,
             target,
@@ -185,7 +181,7 @@ impl FoundationRuntime for Arc<LearningPreparationCoordinator> {
                 ));
             }
         };
-        Ok(FoundationChild {
+        Ok(FoundationPreparationChildRef {
             run_id: run.id.clone(),
             input_fingerprint: run.input_fingerprint.clone(),
         })
@@ -217,7 +213,7 @@ trait PreparationTranscriptionRuntime: Send + Sync {
     async fn resolve_audio(
         &self,
         target: &MediaLearningPreparationTarget,
-        requested_audio_track: Option<u32>,
+        requested_audio_track: Option<MediaAudioTrackIndex>,
     ) -> Result<PreparationAudioSelection, ApplicationError>;
     async fn ensure(
         &self,
@@ -232,10 +228,13 @@ impl PreparationTranscriptionRuntime for Arc<TranscriptionCoordinator> {
     async fn resolve_audio(
         &self,
         target: &MediaLearningPreparationTarget,
-        requested_audio_track: Option<u32>,
+        requested_audio_track: Option<MediaAudioTrackIndex>,
     ) -> Result<PreparationAudioSelection, ApplicationError> {
-        self.resolve_preparation_audio_track(&target.media_id, requested_audio_track)
-            .await
+        self.resolve_preparation_audio_track(
+            &target.media_id,
+            requested_audio_track.map(MediaAudioTrackIndex::as_u32),
+        )
+        .await
     }
 
     async fn ensure(
@@ -388,7 +387,7 @@ impl MediaLearningPreparationCoordinator {
                 {
                     PreparationAudioSelection::Selected { audio_track } => {
                         Ok(MediaLearningPreparationSourceInspection::Asr {
-                            audio_track: Some(audio_track),
+                            audio_track: Some(MediaAudioTrackIndex::new(audio_track)),
                         })
                     }
                     PreparationAudioSelection::SelectionRequired { .. } => Ok(
@@ -515,28 +514,9 @@ impl MediaLearningPreparationCoordinator {
                     job_id: None,
                     ..
                 } => {
-                    let Some(audio_track) = audio_track else {
-                        return Err(ApplicationError::Conflict(
-                            "ASR audio track was not resolved",
-                        ));
-                    };
-                    let idempotency_key =
-                        format!("media-learning-preparation:{}:asr", run.id.as_str());
-                    let child_id = preparation_transcription_child_id(&idempotency_key)?;
-                    let job = self
-                        .transcription
-                        .ensure(EnsurePreparationTranscriptionRequest {
-                            idempotency_key,
-                            child_id: child_id.clone(),
-                            media_id: run.target.media_id.clone(),
-                            language: run
-                                .target
-                                .requested_learning_language
-                                .as_ref()
-                                .map(|language| language.as_str().to_owned()),
-                            audio_track,
-                        })
-                        .await?;
+                    let request = preparation_asr_ensure_request(&run, audio_track)?;
+                    let child_id = request.child_id.clone();
+                    let job = self.transcription.ensure(request).await?;
                     if job.id != child_id {
                         return Err(ApplicationError::Conflict(
                             "ASR ensure returned another deterministic child",
@@ -609,33 +589,14 @@ impl MediaLearningPreparationCoordinator {
                         TranscriptionJobStatus::Failed
                             if job.error_code.as_deref() == Some("interrupted") =>
                         {
-                            let Some(audio_track) = audio_track else {
-                                return Err(ApplicationError::Conflict(
-                                    "ASR audio track was not resolved",
-                                ));
-                            };
-                            let idempotency_key =
-                                format!("media-learning-preparation:{}:asr", run.id.as_str());
-                            let child_id = preparation_transcription_child_id(&idempotency_key)?;
+                            let request = preparation_asr_ensure_request(&run, audio_track)?;
+                            let child_id = request.child_id.clone();
                             if child_id != job_id {
                                 return Err(ApplicationError::Conflict(
                                     "attached ASR child identity changed",
                                 ));
                             }
-                            let restarted = self
-                                .transcription
-                                .ensure(EnsurePreparationTranscriptionRequest {
-                                    idempotency_key,
-                                    child_id,
-                                    media_id: run.target.media_id.clone(),
-                                    language: run
-                                        .target
-                                        .requested_learning_language
-                                        .as_ref()
-                                        .map(|language| language.as_str().to_owned()),
-                                    audio_track,
-                                })
-                                .await?;
+                            let restarted = self.transcription.ensure(request).await?;
                             if restarted.id != job_id
                                 || input_provenance_fingerprint.as_deref()
                                     != Some(restarted.input_fingerprint.as_str())
@@ -714,12 +675,7 @@ impl MediaLearningPreparationCoordinator {
                     let child = self.foundation.prepare(target)?;
                     run = self.use_cases.command(
                         &id,
-                        MediaLearningPreparationCommand::AttachFoundationChild {
-                            child: FoundationPreparationChildRef {
-                                run_id: child.run_id,
-                                input_fingerprint: child.input_fingerprint,
-                            },
-                        },
+                        MediaLearningPreparationCommand::AttachFoundationChild { child },
                         now_ms(),
                     )?;
                 }
@@ -799,12 +755,28 @@ impl MediaLearningPreparationCoordinator {
     }
 
     fn cancel_children(&self, run: &MediaLearningPreparation) {
-        if let SubtitleTextTrackSlot::AsrChild {
-            job_id: Some(job_id),
-            ..
-        } = &run.subtitle_text_track
-        {
-            let _ = self.transcription.cancel(job_id);
+        if let SubtitleTextTrackSlot::AsrChild { job_id, .. } = &run.subtitle_text_track {
+            let child_id = match job_id.clone() {
+                Some(job_id) => Some(job_id),
+                None => preparation_asr_child_identity(run)
+                    .ok()
+                    .map(|identity| identity.child_id),
+            };
+            if let Some(child_id) = child_id {
+                let should_cancel = match self.transcription.job(&child_id) {
+                    Ok(Some(job)) => matches!(
+                        job.status,
+                        TranscriptionJobStatus::Queued
+                            | TranscriptionJobStatus::Extracting
+                            | TranscriptionJobStatus::Transcribing
+                    ),
+                    Ok(None) => false,
+                    Err(_) => true,
+                };
+                if should_cancel {
+                    let _ = self.transcription.cancel(&child_id);
+                }
+            }
         }
         if let FoundationPreparationSlot::Child { child } = &run.foundation {
             let _ = self.foundation.cancel(&child.run_id);
@@ -832,6 +804,48 @@ impl MediaLearningPreparationCoordinator {
     }
 }
 
+struct PreparationAsrChildIdentity {
+    idempotency_key: String,
+    child_id: TranscriptionJobId,
+}
+
+fn preparation_asr_child_identity(
+    run: &MediaLearningPreparation,
+) -> Result<PreparationAsrChildIdentity, ApplicationError> {
+    let idempotency_key = format!(
+        "media-learning-preparation-input:{}:asr",
+        run.input_fingerprint
+    );
+    let child_id = preparation_transcription_child_id(&idempotency_key)?;
+    Ok(PreparationAsrChildIdentity {
+        idempotency_key,
+        child_id,
+    })
+}
+
+fn preparation_asr_ensure_request(
+    run: &MediaLearningPreparation,
+    audio_track: MediaAudioTrackIndex,
+) -> Result<EnsurePreparationTranscriptionRequest, ApplicationError> {
+    let identity = preparation_asr_child_identity(run)?;
+    Ok(EnsurePreparationTranscriptionRequest {
+        idempotency_key: identity.idempotency_key,
+        child_id: identity.child_id,
+        media_id: run.target.media_id.clone(),
+        language: run
+            .target
+            .requested_learning_language
+            .as_ref()
+            .map(|language| language.as_str().to_owned()),
+        audio_track: audio_track.as_u32(),
+        terminal_policy: if run.retry_of_id.is_some() {
+            PreparationTranscriptionTerminalPolicy::Restart
+        } else {
+            PreparationTranscriptionTerminalPolicy::Preserve
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -853,6 +867,7 @@ mod tests {
         resolve_calls: AtomicUsize,
         ensure_calls: AtomicUsize,
         idempotency_keys: Mutex<Vec<String>>,
+        terminal_policies: Mutex<Vec<PreparationTranscriptionTerminalPolicy>>,
     }
 
     #[async_trait]
@@ -860,7 +875,7 @@ mod tests {
         async fn resolve_audio(
             &self,
             _target: &MediaLearningPreparationTarget,
-            _requested_audio_track: Option<u32>,
+            _requested_audio_track: Option<MediaAudioTrackIndex>,
         ) -> Result<PreparationAudioSelection, ApplicationError> {
             self.resolve_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.audio.clone())
@@ -874,7 +889,11 @@ mod tests {
             self.idempotency_keys
                 .lock()
                 .unwrap()
-                .push(request.idempotency_key);
+                .push(request.idempotency_key.clone());
+            self.terminal_policies
+                .lock()
+                .unwrap()
+                .push(request.terminal_policy);
             Err(ApplicationError::Repository(
                 "scripted ASR must not start".into(),
             ))
@@ -904,7 +923,7 @@ mod tests {
         async fn resolve_audio(
             &self,
             _target: &MediaLearningPreparationTarget,
-            _requested_audio_track: Option<u32>,
+            _requested_audio_track: Option<MediaAudioTrackIndex>,
         ) -> Result<PreparationAudioSelection, ApplicationError> {
             unreachable!("startup recovery already has a resolved audio track")
         }
@@ -957,12 +976,63 @@ mod tests {
         cancelled: Mutex<Vec<TranscriptionJobId>>,
     }
 
+    struct CrashWindowTranscription {
+        job: Mutex<TranscriptionJob>,
+        ensure_calls: AtomicUsize,
+        cancel_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PreparationTranscriptionRuntime for CrashWindowTranscription {
+        async fn resolve_audio(
+            &self,
+            _target: &MediaLearningPreparationTarget,
+            _requested_audio_track: Option<MediaAudioTrackIndex>,
+        ) -> Result<PreparationAudioSelection, ApplicationError> {
+            unreachable!("the durable parent already has a resolved audio track")
+        }
+
+        async fn ensure(
+            &self,
+            request: EnsurePreparationTranscriptionRequest,
+        ) -> Result<TranscriptionJob, ApplicationError> {
+            self.ensure_calls.fetch_add(1, Ordering::Relaxed);
+            let job = self.job.lock().unwrap().clone();
+            assert_eq!(request.child_id, job.id);
+            Ok(job)
+        }
+
+        fn job(
+            &self,
+            id: &TranscriptionJobId,
+        ) -> Result<Option<TranscriptionJob>, ApplicationError> {
+            let job = self.job.lock().unwrap().clone();
+            Ok((job.id == *id).then_some(job))
+        }
+
+        fn cancel(&self, id: &TranscriptionJobId) -> Result<(), ApplicationError> {
+            let mut job = self.job.lock().unwrap();
+            if job.id == *id
+                && matches!(
+                    job.status,
+                    TranscriptionJobStatus::Queued
+                        | TranscriptionJobStatus::Extracting
+                        | TranscriptionJobStatus::Transcribing
+                )
+            {
+                job.status = TranscriptionJobStatus::Cancelled;
+                self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl PreparationTranscriptionRuntime for ActiveTranscription {
         async fn resolve_audio(
             &self,
             _target: &MediaLearningPreparationTarget,
-            _requested_audio_track: Option<u32>,
+            _requested_audio_track: Option<MediaAudioTrackIndex>,
         ) -> Result<PreparationAudioSelection, ApplicationError> {
             Ok(PreparationAudioSelection::Selected { audio_track: 0 })
         }
@@ -1008,7 +1078,7 @@ mod tests {
         async fn resolve_audio(
             &self,
             _target: &MediaLearningPreparationTarget,
-            _requested_audio_track: Option<u32>,
+            _requested_audio_track: Option<MediaAudioTrackIndex>,
         ) -> Result<PreparationAudioSelection, ApplicationError> {
             Ok(PreparationAudioSelection::Selected { audio_track: 0 })
         }
@@ -1052,9 +1122,9 @@ mod tests {
         fn prepare(
             &self,
             target: FoundationPreparationTarget,
-        ) -> Result<FoundationChild, ApplicationError> {
+        ) -> Result<FoundationPreparationChildRef, ApplicationError> {
             self.prepare_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(FoundationChild {
+            Ok(FoundationPreparationChildRef {
                 run_id: LearningPreparationRunId::from_fingerprint(
                     target.subtitle_text_fingerprint.as_str(),
                 ),
@@ -1234,6 +1304,7 @@ mod tests {
             resolve_calls: AtomicUsize::new(0),
             ensure_calls: AtomicUsize::new(0),
             idempotency_keys: Mutex::new(Vec::new()),
+            terminal_policies: Mutex::new(Vec::new()),
         });
         let foundation = Arc::new(ScriptedFoundation {
             prepare_calls: AtomicUsize::new(0),
@@ -1270,6 +1341,7 @@ mod tests {
             resolve_calls: AtomicUsize::new(0),
             ensure_calls: AtomicUsize::new(0),
             idempotency_keys: Mutex::new(Vec::new()),
+            terminal_policies: Mutex::new(Vec::new()),
         });
         let foundation = Arc::new(ScriptedFoundation {
             prepare_calls: AtomicUsize::new(0),
@@ -1307,6 +1379,7 @@ mod tests {
             resolve_calls: AtomicUsize::new(0),
             ensure_calls: AtomicUsize::new(0),
             idempotency_keys: Mutex::new(Vec::new()),
+            terminal_policies: Mutex::new(Vec::new()),
         });
         let foundation = Arc::new(ScriptedFoundation {
             prepare_calls: AtomicUsize::new(0),
@@ -1335,13 +1408,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_uses_a_new_asr_child_identity() {
+    async fn retry_reuses_the_same_asr_child_identity() {
         let (repository, services, media) = setup();
         let transcription = Arc::new(ScriptedTranscription {
             audio: PreparationAudioSelection::Selected { audio_track: 0 },
             resolve_calls: AtomicUsize::new(0),
             ensure_calls: AtomicUsize::new(0),
             idempotency_keys: Mutex::new(Vec::new()),
+            terminal_policies: Mutex::new(Vec::new()),
         });
         let foundation = Arc::new(ScriptedFoundation {
             prepare_calls: AtomicUsize::new(0),
@@ -1364,7 +1438,19 @@ mod tests {
 
         let keys = transcription.idempotency_keys.lock().unwrap();
         assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(
+            preparation_transcription_child_id(&keys[0]).unwrap(),
+            preparation_transcription_child_id(&keys[1]).unwrap()
+        );
+        drop(keys);
+        assert_eq!(
+            *transcription.terminal_policies.lock().unwrap(),
+            vec![
+                PreparationTranscriptionTerminalPolicy::Preserve,
+                PreparationTranscriptionTerminalPolicy::Restart,
+            ]
+        );
     }
 
     #[test]
@@ -1423,6 +1509,7 @@ mod tests {
             resolve_calls: AtomicUsize::new(0),
             ensure_calls: AtomicUsize::new(0),
             idempotency_keys: Mutex::new(Vec::new()),
+            terminal_policies: Mutex::new(Vec::new()),
         });
         let foundation = Arc::new(ScriptedFoundation {
             prepare_calls: AtomicUsize::new(0),
@@ -1477,7 +1564,7 @@ mod tests {
 
         let replacement_request = MediaLearningPreparationRequest {
             explicit_subtitle_track_id: None,
-            explicit_audio_track: Some(0),
+            explicit_audio_track: Some(MediaAudioTrackIndex::new(0)),
         };
         let PrepareMediaLearningResult::Replaced { run, invalidated } = coordinator
             .prepare(target(&media), replacement_request)
@@ -1509,6 +1596,7 @@ mod tests {
         );
 
         let replacement_job_id = wait_asr_attached(&coordinator, &run.id).await;
+        assert_ne!(replacement_job_id, first_job_id);
         coordinator.cancel(&run.id).unwrap();
         let cancelled = wait_terminal(&coordinator, &run.id).await;
         assert_eq!(cancelled.status, MediaLearningPreparationStatus::Cancelled);
@@ -1534,7 +1622,7 @@ mod tests {
                 target(&media),
                 request(),
                 MediaLearningPreparationSourceInspection::Asr {
-                    audio_track: Some(0),
+                    audio_track: Some(MediaAudioTrackIndex::new(0)),
                 },
                 10,
             )
@@ -1545,8 +1633,9 @@ mod tests {
         let running = use_cases
             .command(&created.id, MediaLearningPreparationCommand::Start, 11)
             .unwrap();
-        let idempotency_key = format!("media-learning-preparation:{}:asr", running.id.as_str());
-        let job_id = preparation_transcription_child_id(&idempotency_key).unwrap();
+        let identity = preparation_asr_child_identity(&running).unwrap();
+        let idempotency_key = identity.idempotency_key;
+        let job_id = identity.child_id;
         let input_fingerprint = "stable-asr-input";
         use_cases
             .command(
@@ -1596,14 +1685,15 @@ mod tests {
 
         let recovered = coordinator.get(&created.id).unwrap();
         assert_eq!(recovered.status, MediaLearningPreparationStatus::Running);
-        assert_eq!(
+        assert!(matches!(
             recovered.subtitle_text_track,
             SubtitleTextTrackSlot::AsrChild {
-                audio_track: Some(0),
-                job_id: Some(job_id),
-                input_provenance_fingerprint: Some(input_fingerprint.into()),
-            }
-        );
+                audio_track,
+                job_id: Some(_),
+                input_provenance_fingerprint: Some(ref fingerprint),
+            } if audio_track == MediaAudioTrackIndex::new(0)
+                && fingerprint == input_fingerprint
+        ));
         {
             let requests = transcription.ensure_requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -1614,6 +1704,78 @@ mod tests {
         coordinator.cancel(&created.id).unwrap();
         let cancelled = wait_terminal(&coordinator, &created.id).await;
         assert_eq!(cancelled.status, MediaLearningPreparationStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn startup_cancel_derives_and_cancels_an_asr_child_created_before_attach() {
+        let (repository, services, media) = setup();
+        let inspector = Arc::new(LocalMediaLearningPreparationInspector {
+            services: services.clone(),
+        });
+        let use_cases =
+            MediaLearningPreparationUseCases::new(repository.clone(), inspector.clone());
+        let PrepareMediaLearningResult::Run(created) = use_cases
+            .prepare_resolved(
+                target(&media),
+                request(),
+                MediaLearningPreparationSourceInspection::Asr {
+                    audio_track: Some(MediaAudioTrackIndex::new(0)),
+                },
+                10,
+            )
+            .unwrap()
+        else {
+            panic!("expected durable parent run");
+        };
+        let running = use_cases
+            .command(&created.id, MediaLearningPreparationCommand::Start, 11)
+            .unwrap();
+        assert!(matches!(
+            running.subtitle_text_track,
+            SubtitleTextTrackSlot::AsrChild { job_id: None, .. }
+        ));
+        let identity = preparation_asr_child_identity(&running).unwrap();
+        let child = transcription_job(
+            identity.child_id,
+            media.id.clone(),
+            &media.fingerprint,
+            Some("en".into()),
+            0,
+            "created-before-parent-attach",
+            TranscriptionJobStatus::Queued,
+        );
+        let transcription = Arc::new(CrashWindowTranscription {
+            job: Mutex::new(child),
+            ensure_calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
+        });
+        let foundation = Arc::new(ScriptedFoundation {
+            prepare_calls: AtomicUsize::new(0),
+        });
+
+        let coordinator = MediaLearningPreparationCoordinator::new_with_adapters(
+            services,
+            repository,
+            inspector,
+            transcription.clone(),
+            foundation.clone(),
+        )
+        .unwrap();
+        let cancelling = coordinator.cancel(&created.id).unwrap();
+        assert_eq!(
+            cancelling.status,
+            MediaLearningPreparationStatus::Cancelling
+        );
+        let cancelled = wait_terminal(&coordinator, &created.id).await;
+
+        assert_eq!(cancelled.status, MediaLearningPreparationStatus::Cancelled);
+        assert_eq!(transcription.ensure_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(transcription.cancel_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(foundation.prepare_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            transcription.job.lock().unwrap().status,
+            TranscriptionJobStatus::Cancelled
+        );
     }
 
     #[tokio::test]

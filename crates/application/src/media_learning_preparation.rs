@@ -9,6 +9,62 @@ use crate::{ApplicationError, FoundationPreparationTarget, LearningPreparationRu
 const MEDIA_LEARNING_PREPARATION_VERSION: &str = "media-learning-preparation-v1";
 const INPUTS_CHANGED_ERROR: &str = "media preparation inputs changed";
 
+/// Zero-based audio-stream index used only by the internal content preparation
+/// workflow. The type prevents unresolved or negative stream selections from
+/// entering durable parent state; adapters convert it to their native index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MediaAudioTrackIndex(u32);
+
+impl MediaAudioTrackIndex {
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn try_from_u64(value: u64) -> Result<Self, ApplicationError> {
+        u32::try_from(value).map(Self).map_err(|_| {
+            ApplicationError::Invalid(
+                "audio track index must fit an unsigned 32-bit integer".into(),
+            )
+        })
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for MediaAudioTrackIndex {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<MediaAudioTrackIndex> for u32 {
+    fn from(value: MediaAudioTrackIndex) -> Self {
+        value.as_u32()
+    }
+}
+
+impl TryFrom<u64> for MediaAudioTrackIndex {
+    type Error = ApplicationError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::try_from_u64(value)
+    }
+}
+
+impl TryFrom<i64> for MediaAudioTrackIndex {
+    type Error = ApplicationError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        let value = u64::try_from(value).map_err(|_| {
+            ApplicationError::Invalid("audio track index must not be negative".into())
+        })?;
+        Self::try_from_u64(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MediaLearningPreparationId(String);
@@ -89,14 +145,14 @@ impl SubtitleTextTrackSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaLearningPreparationRequest {
     pub explicit_subtitle_track_id: Option<SubtitleTrackId>,
-    pub explicit_audio_track: Option<u32>,
+    pub explicit_audio_track: Option<MediaAudioTrackIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "source")]
 enum ResolvedMediaSubtitleSource {
     Existing { snapshot: SubtitleTextTrackSnapshot },
-    Asr { audio_track: Option<u32> },
+    Asr { audio_track: MediaAudioTrackIndex },
 }
 
 impl ResolvedMediaSubtitleSource {
@@ -110,12 +166,7 @@ impl ResolvedMediaSubtitleSource {
                 snapshot.text_snapshot_fingerprint.clone(),
                 snapshot.language.as_str().into(),
             ],
-            Self::Asr { audio_track } => vec![
-                "asr".into(),
-                audio_track
-                    .map(|track| track.to_string())
-                    .unwrap_or_else(|| "default".into()),
-            ],
+            Self::Asr { audio_track } => vec!["asr".into(), audio_track.as_u32().to_string()],
         }
     }
 }
@@ -127,7 +178,7 @@ pub enum MediaLearningPreparationSourceInspection {
         snapshot: SubtitleTextTrackSnapshot,
     },
     Asr {
-        audio_track: Option<u32>,
+        audio_track: Option<MediaAudioTrackIndex>,
     },
     SelectionRequired {
         reason: MediaLearningPreparationSelectionRequired,
@@ -166,7 +217,7 @@ pub enum SubtitleTextTrackSlot {
         snapshot: SubtitleTextTrackSnapshot,
     },
     AsrChild {
-        audio_track: Option<u32>,
+        audio_track: MediaAudioTrackIndex,
         job_id: Option<TranscriptionJobId>,
         input_provenance_fingerprint: Option<String>,
     },
@@ -736,7 +787,7 @@ fn validate_resolved_source(
             if request.explicit_subtitle_track_id.is_some()
                 || request
                     .explicit_audio_track
-                    .is_some_and(|requested| Some(requested) != *audio_track)
+                    .is_some_and(|requested| requested != *audio_track)
             {
                 return Err(ApplicationError::Invalid(
                     "resolved ASR source does not match the media request".into(),
@@ -760,7 +811,7 @@ fn media_preparation_input_fingerprint(
         .unwrap_or("automatic");
     let explicit_audio = request
         .explicit_audio_track
-        .map(|track| track.to_string())
+        .map(|track| track.as_u32().to_string())
         .unwrap_or_else(|| "automatic".into());
     let mut fields = vec![
         target.media_id.as_str(),
@@ -925,6 +976,11 @@ impl MediaLearningPreparationUseCases {
                 ResolvedMediaSubtitleSource::Existing { snapshot }
             }
             MediaLearningPreparationSourceInspection::Asr { audio_track } => {
+                let audio_track = audio_track.ok_or_else(|| {
+                    ApplicationError::Invalid(
+                        "resolved ASR source requires a concrete audio track".into(),
+                    )
+                })?;
                 ResolvedMediaSubtitleSource::Asr { audio_track }
             }
             MediaLearningPreparationSourceInspection::SelectionRequired { reason } => {
@@ -1049,7 +1105,7 @@ mod tests {
     ) -> MediaLearningPreparationRequest {
         MediaLearningPreparationRequest {
             explicit_subtitle_track_id,
-            explicit_audio_track,
+            explicit_audio_track: explicit_audio_track.map(MediaAudioTrackIndex::new),
         }
     }
 
@@ -1118,12 +1174,27 @@ mod tests {
     }
 
     #[test]
+    fn audio_track_index_is_transparent_and_rejects_invalid_integer_conversions() {
+        let track = MediaAudioTrackIndex::try_from(3_u64).unwrap();
+
+        assert_eq!(track.as_u32(), 3);
+        assert_eq!(serde_json::to_string(&track).unwrap(), "3");
+        assert_eq!(
+            serde_json::from_str::<MediaAudioTrackIndex>("3").unwrap(),
+            track
+        );
+        assert!(MediaAudioTrackIndex::try_from(-1_i64).is_err());
+        assert!(MediaAudioTrackIndex::try_from(u64::from(u32::MAX) + 1).is_err());
+        assert!(serde_json::from_str::<MediaAudioTrackIndex>("-1").is_err());
+    }
+
+    #[test]
     fn asr_child_must_be_attached_before_it_can_freeze_a_subtitle_snapshot() {
         let mut preparation = MediaLearningPreparation::new(
             target(),
             request(None, Some(2)),
             ResolvedMediaSubtitleSource::Asr {
-                audio_track: Some(2),
+                audio_track: MediaAudioTrackIndex::new(2),
             },
             1,
         )
@@ -1171,7 +1242,7 @@ mod tests {
             target(),
             request(None, Some(2)),
             ResolvedMediaSubtitleSource::Asr {
-                audio_track: Some(2),
+                audio_track: MediaAudioTrackIndex::new(2),
             },
             1,
         )
@@ -1228,7 +1299,9 @@ mod tests {
         let mut preparation = MediaLearningPreparation::new(
             target(),
             request(None, None),
-            ResolvedMediaSubtitleSource::Asr { audio_track: None },
+            ResolvedMediaSubtitleSource::Asr {
+                audio_track: MediaAudioTrackIndex::new(0),
+            },
             1,
         )
         .unwrap();
